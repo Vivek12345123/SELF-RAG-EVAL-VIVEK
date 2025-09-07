@@ -236,6 +236,91 @@ def main(_):
   long_answer_stats, short_answer_stats = score_answers(nq_gold_dict,
                                                         nq_pred_dict)
 
+  # ---- BERTScore integration (added) ----
+  try:
+    import torch
+    from bert_score.scorer import BERTScorer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Attempt to assemble candidate/ref pairs from available data.
+    # The NQ util may or may not expose helper functions; try some common patterns
+    candidates = []
+    refs = []
+
+    # If util exposes a helper to extract plain text of gold/pred pairs, prefer it.
+    if hasattr(util, "get_gold_pred_text_pairs"):
+      try:
+        candidates, refs = util.get_gold_pred_text_pairs(nq_gold_dict, nq_pred_dict)
+      except Exception:
+        candidates, refs = [], []
+
+    # Otherwise, try extracting short-answer text from pred/gold data structures if present.
+    if not candidates:
+      for ex_id in sorted(nq_gold_dict.keys()):
+        gold_ann = nq_gold_dict[ex_id]
+        pred = nq_pred_dict.get(ex_id)
+        # gather possible gold short-answer strings
+        gold_texts = []
+        # common patterns (best-effort): look for 'short_answers_text' fields in gold or in a list of labels
+        if isinstance(gold_ann, dict) and 'short_answers_text' in gold_ann:
+          gold_texts = gold_ann.get('short_answers_text') or []
+        elif isinstance(gold_ann, (list, tuple)):
+          for g in gold_ann:
+            if isinstance(g, dict) and 'short_answers_text' in g:
+              gold_texts.extend(g.get('short_answers_text') or [])
+        # fallback: try fields named 'short_answers' that may be list of dicts with 'text'
+        if not gold_texts and isinstance(gold_ann, dict) and 'short_answers' in gold_ann:
+          short_list = gold_ann.get('short_answers') or []
+          for s in short_list:
+            if isinstance(s, dict) and 'text' in s:
+              gold_texts.append(s['text'])
+        # obtain candidate text from prediction
+        cand_text = None
+        if pred:
+          if isinstance(pred, dict):
+            if 'short_answers_text' in pred and pred['short_answers_text']:
+              cand_text = pred['short_answers_text'][0]
+            elif 'long_answer_text' in pred:
+              cand_text = pred['long_answer_text']
+            elif 'short_answers' in pred and isinstance(pred['short_answers'], list) and pred['short_answers']:
+              first = pred['short_answers'][0]
+              if isinstance(first, dict) and 'text' in first:
+                cand_text = first['text']
+          # if pred is an object with attributes (older util), try attribute access
+          else:
+            if hasattr(pred, 'short_answers_text') and getattr(pred, 'short_answers_text'):
+              cand_text = getattr(pred, 'short_answers_text')[0]
+            elif hasattr(pred, 'long_answer_text'):
+              cand_text = getattr(pred, 'long_answer_text')
+
+        # only add examples where both candidate and at least one gold ref text exist
+        if cand_text and gold_texts:
+          candidates.append(cand_text)
+          refs.append(gold_texts)
+
+    # If we accumulated pairs, compute BERTScore (otherwise skip)
+    if candidates and refs:
+      scorer = BERTScorer(lang='en', device=device, idf=True, use_fast_tokenizer=True)
+      # compute idf on flattened reference pool
+      flat_refs = []
+      for ref_list in refs:
+        flat_refs.extend(ref_list)
+      if flat_refs:
+        scorer.compute_idf(flat_refs)
+      (P, R, F) = scorer.score(candidates, refs)
+      import numpy as _np
+      bert_mean_p = float(_np.mean(_np.array(P)))
+      bert_mean_r = float(_np.mean(_np.array(R)))
+      bert_mean_f = float(_np.mean(_np.array(F)))
+      print("BERTScore (mean P/R/F): {:.6f} / {:.6f} / {:.6f}".format(bert_mean_p, bert_mean_r, bert_mean_f))
+    else:
+      print("BERTScore: no suitable text pairs extracted from gold/pred data; skipping BERTScore computation.")
+  except Exception as e:
+    # do not fail evaluation if BERTScore isn't available or if extraction failed
+    print("Warning: BERTScore could not be computed:", str(e))
+  # ---- end BERTScore integration ----
+
   if FLAGS.pretty_print:
     print('*' * 20)
     print('LONG ANSWER R@P TABLE:')
