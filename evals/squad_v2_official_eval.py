@@ -261,6 +261,64 @@ def main():
                                   qid_to_has_ans, OPTS.out_image_dir)
     histogram_na_prob(na_probs, has_ans_qids, OPTS.out_image_dir, 'hasAns')
     histogram_na_prob(na_probs, no_ans_qids, OPTS.out_image_dir, 'noAns')
+
+  # --- BERTScore addition for SQuAD: compute BERT P/R/F (mean) over predicted answers vs gold answers ---
+  try:
+    try:
+      from bert_score.scorer import BERTScorer
+      berter = "scorer"
+    except Exception:
+      from bert_score import score as bert_score_func
+      berter = "func"
+  except Exception as e:
+    print("Warning: bert_score not available; skipping BERT scoring. Install with `pip install bert-score` to enable. Error:", e)
+    berter = None
+
+  if berter is not None:
+    # Build aligned lists of predictions and gold references
+    qids = []
+    cands = []
+    refs = []  # list of list[str] (multi-ref)
+    missing = 0
+    for article in dataset:
+      for p in article['paragraphs']:
+        for qa in p['qas']:
+          qid = qa['id']
+          gold_answers = [a['text'] for a in qa['answers'] if normalize_answer(a['text'])]
+          if not gold_answers:
+            gold_answers = ['']  # for no-answer examples
+          if qid not in preds:
+            missing += 1
+            continue
+          pred_ans = preds[qid]
+          qids.append(qid)
+          cands.append(pred_ans)
+          refs.append(gold_answers)
+
+    if missing:
+      print(f"Warning: {missing} qids missing from predictions; skipped for BERT scoring.")
+
+    if cands and refs:
+      try:
+        if berter == "scorer":
+          scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+          P, R, F = scorer.score(cands, refs, verbose=False, batch_size=64)
+        else:
+          # bert_score.score supports refs as list[list[str]]
+          P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
+        bert_p_mean = float(P.mean().item())
+        bert_r_mean = float(R.mean().item())
+        bert_f_mean = float(F.mean().item())
+        # Convert to percentage to match SQuAD scale (0..100)
+        out_eval["bert_exact_precision"] = round(bert_p_mean * 100.0, 6)
+        out_eval["bert_exact_recall"] = round(bert_r_mean * 100.0, 6)
+        out_eval["bert_exact_f1"] = round(bert_f_mean * 100.0, 6)
+        print("BERTScore (mean) P/R/F (percent):", out_eval["bert_exact_precision"], out_eval["bert_exact_recall"], out_eval["bert_exact_f1"])
+      except Exception as e:
+        print("Warning: BERT scoring failed for SQuAD:", e)
+    else:
+      print("No predictions/refs to compute BERTScore for SQuAD.")
+
   if OPTS.out_file:
     with open(OPTS.out_file, 'w') as f:
       json.dump(out_eval, f)
