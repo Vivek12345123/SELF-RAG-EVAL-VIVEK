@@ -433,7 +433,7 @@ def main():
             "nq": ("sentence-transformers/natural-questions", None, args.nq_split),
             "trivia": ("mandarjoshi/trivia_qa", "rc", args.trivia_split),
             "fever": ("mwong/fever-evidence-related", None, "train"),
-            "CRAG": ("Quivr/CRAG", None, "train"),
+            "crag": ("Quivr/CRAG", None, "train"),
         }
         for k, (dsid, cfg, split) in hf_tasks.items():
             try:
