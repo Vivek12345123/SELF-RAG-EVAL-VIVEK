@@ -3,7 +3,8 @@ import json
 import re
 import string
 from collections import Counter
-
+import torch
+import code_bert_score  # added for BERTScore
 
 def normalize_answer(s):
 
@@ -82,8 +83,20 @@ def update_sp(metrics, prediction, gold):
     metrics['sp_recall'] += recall
     return em, prec, recall
 
+def compute_codebert_score(predictions, references, lang='python', device='cuda:0'):
+    """
+    Compute CodeBERTScore for a list of prediction strings and references.
+    Returns avg_precision, avg_recall, avg_f1, avg_f3
+    """
+    P, R, F1, F3 = code_bert_score.score(
+        cands=predictions,
+        refs=references,
+        lang=lang,
+        device=device
+    )
+    return float(P.mean()), float(R.mean()), float(F1.mean()), float(F3.mean())
 
-def eval(prediction_file, gold_file):
+def eval(prediction_file, gold_file, codebert_lang='python', device='cuda:0'):
     with open(prediction_file) as f:
         prediction = json.load(f)
     with open(gold_file) as f:
@@ -92,21 +105,33 @@ def eval(prediction_file, gold_file):
     metrics = {'em': 0, 'f1': 0, 'prec': 0, 'recall': 0,
         'sp_em': 0, 'sp_f1': 0, 'sp_prec': 0, 'sp_recall': 0,
         'joint_em': 0, 'joint_f1': 0, 'joint_prec': 0, 'joint_recall': 0}
+
+    # For BERTScore
+    codebert_preds, codebert_refs = [], []
+
     for dp in gold:
         cur_id = dp['_id']
         can_eval_joint = True
         if cur_id not in prediction['answer']:
             print('missing answer {}'.format(cur_id))
             can_eval_joint = False
+            pred_text = ""
         else:
-            em, prec, recall = update_answer(
-                metrics, prediction['answer'][cur_id], dp['answer'])
+            pred_text = prediction['answer'][cur_id]
+        gold_text = dp['answer']
+        codebert_preds.append(pred_text)
+        codebert_refs.append(gold_text)
+
+        if cur_id in prediction['answer']:
+            em, prec, recall = update_answer(metrics, pred_text, gold_text)
+        else:
+            em, prec, recall = 0, 0, 0
+
         if cur_id not in prediction['sp']:
             print('missing sp fact {}'.format(cur_id))
             can_eval_joint = False
         else:
-            sp_em, sp_prec, sp_recall = update_sp(
-                metrics, prediction['sp'][cur_id], dp['supporting_facts'])
+            sp_em, sp_prec, sp_recall = update_sp(metrics, prediction['sp'][cur_id], dp['supporting_facts'])
 
         if can_eval_joint:
             joint_prec = prec * sp_prec
@@ -126,8 +151,18 @@ def eval(prediction_file, gold_file):
     for k in metrics.keys():
         metrics[k] /= N
 
+    # Compute CodeBERTScore
+    cb_prec, cb_recall, cb_f1, cb_f3 = compute_codebert_score(codebert_preds, codebert_refs, lang=codebert_lang, device=device)
+    metrics['codebert_prec'] = cb_prec
+    metrics['codebert_recall'] = cb_recall
+    metrics['codebert_f1'] = cb_f1
+    metrics['codebert_f3'] = cb_f3
+
     print(metrics)
 
 
 if __name__ == '__main__':
-    eval(sys.argv[1], sys.argv[2])
+    # Usage: python eval_script.py predictions.json gold.json [lang] [device]
+    lang = sys.argv[3] if len(sys.argv) > 3 else 'python'
+    device = sys.argv[4] if len(sys.argv) > 4 else 'cuda:0'
+    eval(sys.argv[1], sys.argv[2], codebert_lang=lang, device=device)
