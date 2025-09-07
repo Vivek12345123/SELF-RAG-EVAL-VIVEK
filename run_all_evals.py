@@ -372,7 +372,7 @@ def run_hotpot(model, sampling_params, format_prompt, dataset_key="hotpotqa/hotp
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     from datasets import load_dataset
     logging.info("[hotpot] Loading dataset %s split=%s", dataset_key, split)
-    ds = load_dataset(dataset_key, split=split)
+    ds = load_dataset(dataset_key, "distractor", split=split)
     ds = ds.select(range(min(MAX_SAMPLES, len(ds))))
     preds = {"answer": {}, "sp": {}}
     from vllm import SamplingParams as VSamplingParams
