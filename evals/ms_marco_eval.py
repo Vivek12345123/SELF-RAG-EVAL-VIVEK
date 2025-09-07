@@ -147,6 +147,36 @@ def compute_metrics_from_files(p_path_to_reference_file,
         similarity += answersimilarity/len(reference_answer)
     semantic_similarity = similarity/len(filtered_reference_dictionary) if filtered_reference_dictionary else 0.0
     all_scores['Semantic_Similarity'] = semantic_similarity
+
+    # ---- BERTScore integration (added) ----
+    try:
+        import torch
+        from bert_score.scorer import BERTScorer
+        # pick device automatically
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # build scorer (defaults chosen to be robust)
+        scorer = BERTScorer(lang='en', device=device, idf=True, use_fast_tokenizer=True)
+        # compute idf over full reference pool (flatten)
+        flat_refs = []
+        for ref_list in refs_by_id:
+            flat_refs.extend(ref_list)
+        if flat_refs:
+            scorer.compute_idf(flat_refs)
+        # scorer.score accepts list[str] or list[list[str]] for refs
+        (P, R, F) = scorer.score(sys_outputs, refs_by_id)
+        # add mean scores
+        import numpy as _np
+        all_scores['bertscore_p'] = float(_np.mean(_np.array(P)))
+        all_scores['bertscore_r'] = float(_np.mean(_np.array(R)))
+        all_scores['bertscore_f1'] = float(_np.mean(_np.array(F)))
+    except Exception as e:
+        # if anything goes wrong, do not crash the entire script — just warn
+        print("Warning: BERTScore could not be computed:", str(e), file=sys.stderr)
+        all_scores['bertscore_p'] = None
+        all_scores['bertscore_r'] = None
+        all_scores['bertscore_f1'] = None
+    # ---- end BERTScore integration ----
+
     return all_scores
 
 def main():
