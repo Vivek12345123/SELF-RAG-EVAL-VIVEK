@@ -301,7 +301,8 @@ def main(_):
 
     # If we accumulated pairs, compute BERTScore (otherwise skip)
     if candidates and refs:
-      scorer = BERTScorer(lang='en', device=device, idf=True, use_fast_tokenizer=True)
+      # Force roberta-large
+      scorer = BERTScorer(model_type="roberta-large", lang='en', device=device, idf=True, use_fast_tokenizer=True)
       # compute idf on flattened reference pool
       flat_refs = []
       for ref_list in refs:
