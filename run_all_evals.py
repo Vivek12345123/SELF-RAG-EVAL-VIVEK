@@ -58,6 +58,8 @@ HOTPOT_SCRIPT = EVALS_DIR / "hotpot_eval.py"
 MSMARCO_SCRIPT = EVALS_DIR / "ms_marco_eval.py"
 NQ_SCRIPT = EVALS_DIR / "natural_questions_official_eval.py"
 TRIVIA_SCRIPT = EVALS_DIR / "triviaqa_eval.py"
+CRAG_SCRIPT = EVALS_DIR / "crag_eval.py"
+
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -70,7 +72,8 @@ def check_disk_space(path="."):
     logging.info(f"[disk] total={bytes_to_gb(usage.total):.1f}GB used={bytes_to_gb(usage.used):.1f}GB free={bytes_to_gb(free):.1f}GB")
     if free < MIN_FREE_BYTES_WARN:
         logging.warning(f"Free disk < {bytes_to_gb(MIN_FREE_BYTES_WARN):.1f}GB. Full downloads may fail. Use --max-examples for testing.")
-
+def run_crag():
+    run_script(CRAG_SCRIPT, "CRAG")
 # --- Minimal TGI-compatible adapter (Flask) that wraps vLLM generate ---
 def start_tgi_adapter_in_thread(tgi_host: str, tgi_port: int, model_obj, sampling_params):
     """
@@ -430,6 +433,7 @@ def main():
             "nq": ("sentence-transformers/natural-questions", None, args.nq_split),
             "trivia": ("mandarjoshi/trivia_qa", "rc", args.trivia_split),
             "fever": ("mwong/fever-evidence-related", None, "train"),
+            "CRAG": ("Quivr/CRAG", None, "train"),
         }
         for k, (dsid, cfg, split) in hf_tasks.items():
             try:
