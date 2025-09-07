@@ -10,7 +10,6 @@ import argparse
 import utils.dataset_utils
 import utils.utils
 
-
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
 
@@ -190,10 +189,16 @@ if __name__ == '__main__':
         if cands and refs:
             try:
                 if _berter == "scorer":
-                    scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+                    # Force roberta-large
+                    device = "cuda" if (hasattr(torch, 'cuda') and torch.cuda.is_available()) else "cpu"
+                    scorer = BERTScorer(model_type="roberta-large", lang="en", idf=False, batch_size=64, use_fast_tokenizer=True, device=device)
                     P, R, F = scorer.score(cands, refs, verbose=False, batch_size=64)
                 else:
-                    P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
+                    # functional API: try model_type first, fallback to lang
+                    try:
+                        P, R, F = bert_score_func(cands, refs, model_type="roberta-large", verbose=False, batch_size=64)
+                    except TypeError:
+                        P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
                 # convert to percentage 0..100 to match other metrics
                 bert_p_mean = float(P.mean().item()) * 100.0
                 bert_r_mean = float(R.mean().item()) * 100.0
