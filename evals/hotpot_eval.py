@@ -5,6 +5,7 @@ import string
 from collections import Counter
 import torch
 import code_bert_score  # added for BERTScore
+import numpy as _np
 
 def normalize_answer(s):
 
@@ -83,18 +84,83 @@ def update_sp(metrics, prediction, gold):
     metrics['sp_recall'] += recall
     return em, prec, recall
 
-def compute_codebert_score(predictions, references, lang='python', device='cuda:0'):
+def compute_codebert_score(predictions, references, lang='python', device='cuda:0', batch_size=64, idf=True, use_fast_tokenizer=True):
     """
-    Compute CodeBERTScore for a list of prediction strings and references.
-    Returns avg_precision, avg_recall, avg_f1, avg_f3
+    Compute BERTScore (forced to 'roberta-large') and return mean_precision, mean_recall, mean_f1, mean_f3.
+    Attempts canonical bert_score first; falls back to code_bert_score if needed.
     """
-    P, R, F1, F3 = code_bert_score.score(
-        cands=predictions,
-        refs=references,
-        lang=lang,
-        device=device
-    )
-    return float(P.mean()), float(R.mean()), float(F1.mean()), float(F3.mean())
+    # Accept either "cuda:0" or "cuda"
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # try canonical bert_score implementation with explicit model_type
+    try:
+        from bert_score.scorer import BERTScorer
+        # Build scorer forcing roberta-large
+        scorer = BERTScorer(
+            model_type="roberta-large",
+            num_layers=None,
+            batch_size=batch_size,
+            nthreads=4,
+            all_layers=False,
+            idf=bool(idf),
+            idf_sents=None,
+            device=device,
+            lang=None,
+            rescale_with_baseline=False,
+            baseline_path=None,
+            use_fast_tokenizer=use_fast_tokenizer,
+        )
+        # compute idf on flattened refs if idf requested
+        flat_refs = []
+        if len(references) > 0 and isinstance(references[0], (list, tuple)):
+            for rlist in references:
+                flat_refs.extend(rlist)
+        else:
+            flat_refs = list(references)
+        if idf and flat_refs:
+            scorer.compute_idf(flat_refs)
+
+        P_arr, R_arr, F_arr = scorer.score(predictions, references)
+        meanP = float(_np.mean(_np.array(P_arr)))
+        meanR = float(_np.mean(_np.array(R_arr)))
+        meanF = float(_np.mean(_np.array(F_arr)))
+        # F3 (beta=3)
+        beta2 = 9.0
+        meanF3 = (1.0 + beta2) * meanP * meanR / (beta2 * meanP + meanR) if (beta2 * meanP + meanR) > 0 else 0.0
+        return meanP, meanR, meanF, meanF3
+
+    except Exception as e1:
+        # fallback: try code_bert_score (attempt to ask it to use roberta-large if supported)
+        try:
+            # try passing model_type first (some wrappers accept it)
+            try:
+                res = code_bert_score.score(
+                    cands=predictions,
+                    refs=references,
+                    model_type="roberta-large",
+                    device=device,
+                    idf=idf,
+                    batch_size=batch_size,
+                    use_fast_tokenizer=use_fast_tokenizer,
+                )
+            except TypeError:
+                # older wrapper signature: do not pass model_type
+                res = code_bert_score.score(cands=predictions, refs=references, device=device)
+
+            # expect at least (P,R,F)
+            if len(res) >= 3:
+                P_arr, R_arr, F_arr = res[0], res[1], res[2]
+                meanP = float(_np.mean(_np.array(P_arr)))
+                meanR = float(_np.mean(_np.array(R_arr)))
+                meanF = float(_np.mean(_np.array(F_arr)))
+                beta2 = 9.0
+                meanF3 = (1.0 + beta2) * meanP * meanR / (beta2 * meanP + meanR) if (beta2 * meanP + meanR) > 0 else 0.0
+                return meanP, meanR, meanF, meanF3
+            else:
+                raise RuntimeError("Unexpected return from code_bert_score.score(): %r" % (res,))
+        except Exception as e2:
+            raise RuntimeError("Failed to compute BERTScore with roberta-large. bert_score error: %s ; code_bert_score error: %s" % (str(e1), str(e2)))
 
 def eval(prediction_file, gold_file, codebert_lang='python', device='cuda:0'):
     with open(prediction_file) as f:
@@ -151,7 +217,7 @@ def eval(prediction_file, gold_file, codebert_lang='python', device='cuda:0'):
     for k in metrics.keys():
         metrics[k] /= N
 
-    # Compute CodeBERTScore
+    # Compute CodeBERTScore (actually BERTScore with roberta-large)
     cb_prec, cb_recall, cb_f1, cb_f3 = compute_codebert_score(codebert_preds, codebert_refs, lang=codebert_lang, device=device)
     metrics['codebert_prec'] = cb_prec
     metrics['codebert_recall'] = cb_recall
