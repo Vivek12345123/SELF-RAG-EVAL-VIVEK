@@ -72,8 +72,126 @@ def check_disk_space(path="."):
     logging.info(f"[disk] total={bytes_to_gb(usage.total):.1f}GB used={bytes_to_gb(usage.used):.1f}GB free={bytes_to_gb(free):.1f}GB")
     if free < MIN_FREE_BYTES_WARN:
         logging.warning(f"Free disk < {bytes_to_gb(MIN_FREE_BYTES_WARN):.1f}GB. Full downloads may fail. Use --max-examples for testing.")
-def run_crag():
-    run_script(CRAG_SCRIPT, "CRAG")
+# --- CRAG: run in-process by importing the CRAG metrics module and calling calculate_metrics ---
+def run_crag(model, sampling_params, format_prompt, dataset_key="Quivr/CRAG", split="train", out_dir=OUT_ROOT / "crag", batch_size=8, max_tokens=64, temp=0.0, top_p=1.0):
+    """
+    Run Self-RAG on the CRAG HF split, build prediction columns, call calculate_metrics()
+    from evals/crag_eval.py (must expose calculate_metrics(annotated_dataset, ...)).
+    Writes metrics JSON to out_dir/crag_metrics.json.
+    """
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    logging.info("[crag] Loading dataset %s split=%s", dataset_key, split)
+    from datasets import load_dataset
+    ds = load_dataset(dataset_key, split=split)
+
+    # Prepare prompts and run model to get 3 scalar predictions per example:
+    # - adherence score (0..1) where 1 means fully supported
+    # - context relevance score (0..1)
+    # - context utilization score (0..1)
+    # Prompt design here is minimal — tweak later for calibration.
+    def make_crag_prompt(question, context):
+        prompt = "### Instruction:\nGiven the question and retrieval context, produce three numbers in JSON form between 0 and 1:\n"
+        prompt += "  {\"adherence\": <0..1>, \"relevance\": <0..1>, \"utilization\": <0..1>}\n\n"
+        prompt += f"Question: {question}\n\nContext: {context}\n\n### Response:\n"
+        return prompt
+
+    from vllm import SamplingParams as VSamplingParams
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=True)
+
+    # We'll build an annotated list-of-dicts that mirrors a HF Dataset-like mapping for calculate_metrics.
+    annotated_rows = []
+    logging.info(f"[crag] Generating CRAG predictions for {len(ds)} examples (batch {batch_size})")
+    examples = []
+    for ex in ds:
+        # Attempt to read common fields; adapt if your CRAG dataset uses different keys.
+        qid = ex.get("id") or ex.get("example_id") or ex.get("qid") or ex.get("question_id") or str(len(examples))
+        question = ex.get("question") or ex.get("query") or ex.get("text") or ""
+        # CRAG contexts may be a list; join safely
+        context = ""
+        if "context" in ex:
+            c = ex["context"]
+            if isinstance(c, list):
+                context = "\n".join([str(x) for x in c])
+            else:
+                context = str(c)
+        examples.append((qid, question, context, ex))
+
+    # Generate in batches
+    for i in range(0, len(examples), batch_size):
+        batch = examples[i:i+batch_size]
+        prompts = [make_crag_prompt(q, ctx) for (_id, q, ctx, _ex) in batch]
+        outs = model.generate(prompts, sp)
+        for j, out in enumerate(outs):
+            raw = out.outputs[0].text.strip()
+            qid, question, context, gold_ex = batch[j]
+            # Try to parse a JSON object from model output; fallback to regex numeric extraction
+            import json, re
+            adherence = float("nan"); relevance = float("nan"); utilization = float("nan")
+            try:
+                # try to find first JSON object in the text
+                m = re.search(r"\{.*?\}", raw, flags=re.S)
+                if m:
+                    obj = json.loads(m.group(0))
+                    adherence = float(obj.get("adherence", float("nan")))
+                    relevance = float(obj.get("relevance", float("nan")))
+                    utilization = float(obj.get("utilization", float("nan")))
+                else:
+                    # fallback: extract first three floats
+                    nums = re.findall(r"[-+]?\d*\.\d+|\d+", raw)
+                    if len(nums) >= 3:
+                        adherence, relevance, utilization = map(float, nums[:3])
+            except Exception:
+                pass
+
+            row = dict(gold_ex) if isinstance(gold_ex, dict) else {}
+            # store prediction columns (names must match what crag_eval.calculate_metrics expects when provided)
+            # We'll use these prediction column names — make sure your crag module can be configured to look for them
+            row["pred_adherence"] = adherence
+            row["pred_context_relevance"] = relevance
+            row["pred_context_utilization"] = utilization
+            annotated_rows.append(row)
+
+    # At this point annotated_rows is a list of dicts. We can call crag eval in-process.
+    try:
+        import importlib
+        crag_mod = importlib.import_module("evals.crag_eval")  # expects evals/crag_eval.py
+    except Exception as e:
+        logging.error(f"[crag] Failed to import evals.crag_eval: {e}. Skipping CRAG eval.")
+        return
+
+    # The calculate_metrics in your module expects a Dataset-like object; we will provide a minimal mapping
+    class SimpleDS:
+        def __init__(self, rows):
+            self._rows = rows
+        def __len__(self):
+            return len(self._rows)
+        def __getitem__(self, key):
+            # allow column access like ds["column_name"] -> list of values
+            if isinstance(key, str):
+                return [r.get(key) for r in self._rows]
+            raise KeyError("SimpleDS supports only string column access")
+
+    annotated_ds = SimpleDS(annotated_rows)
+
+    # Call the calculate_metrics function from crag_eval.py
+    try:
+        metrics = crag_mod.calculate_metrics(
+            annotated_ds,
+            pred_adherence="pred_adherence",
+            pred_context_releavance="pred_context_relevance",   # note: your CRAG code earlier had a typo; we'll pass this name
+            pred_context_utilization="pred_context_utilization",
+            # ground truth fields fallback: those should exist in the dataset rows, otherwise crag code will use defaults
+        )
+    except Exception as e:
+        logging.error(f"[crag] calculate_metrics failed: {e}")
+        metrics = {"error": str(e)}
+
+    # write metrics
+    metrics_path = out_dir / "crag_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as fh:
+        json.dump(metrics, fh, indent=2, ensure_ascii=False)
+    logging.info("[crag] Wrote metrics to %s", metrics_path)
+
 # --- Minimal TGI-compatible adapter (Flask) that wraps vLLM generate ---
 def start_tgi_adapter_in_thread(tgi_host: str, tgi_port: int, model_obj, sampling_params):
     """
