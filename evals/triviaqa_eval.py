@@ -153,4 +153,58 @@ if __name__ == '__main__':
     key_to_ground_truth = utils.dataset_utils.get_key_to_ground_truth(dataset_json)
     predictions = utils.utils.read_json(args.prediction_file)
     eval_dict = evaluate_triviaqa(key_to_ground_truth, predictions)
+    
+    # --- BERTScore addition (non-destructive): compute mean BERT P/R/F over predictions vs ground truths ---
+    try:
+        # Deferred import so script still runs without bert-score installed
+        try:
+            from bert_score.scorer import BERTScorer
+            _berter = "scorer"
+        except Exception:
+            from bert_score import score as bert_score_func
+            _berter = "func"
+    except Exception as e:
+        print("Warning: bert_score not available; skipping BERT scoring. Install with `pip install bert-score` to enable. Error:", e)
+        _berter = None
+
+    if _berter is not None:
+        cands = []
+        refs = []  # list[list[str]]
+        missing = 0
+        for qid in key_to_ground_truth.keys():
+            if qid not in predictions:
+                missing += 1
+                continue
+            pred = predictions[qid]
+            ground_truths = get_ground_truths(key_to_ground_truth[qid])
+            # If there are no ground truths for some reason, skip
+            if not ground_truths:
+                missing += 1
+                continue
+            cands.append(pred if pred is not None else "")
+            refs.append(ground_truths)
+
+        if missing:
+            print("Warning: {} qids missing from predictions or ground truth; skipped for BERT scoring.".format(missing))
+
+        if cands and refs:
+            try:
+                if _berter == "scorer":
+                    scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+                    P, R, F = scorer.score(cands, refs, verbose=False, batch_size=64)
+                else:
+                    P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
+                # convert to percentage 0..100 to match other metrics
+                bert_p_mean = float(P.mean().item()) * 100.0
+                bert_r_mean = float(R.mean().item()) * 100.0
+                bert_f_mean = float(F.mean().item()) * 100.0
+                eval_dict["bert_precision"] = round(bert_p_mean, 6)
+                eval_dict["bert_recall"] = round(bert_r_mean, 6)
+                eval_dict["bert_f1"] = round(bert_f_mean, 6)
+                print("BERTScore (mean) P/R/F (percent):", eval_dict["bert_precision"], eval_dict["bert_recall"], eval_dict["bert_f1"])
+            except Exception as e:
+                print("Warning: BERT scoring failed for TriviaQA:", e)
+        else:
+            print("No predictions/refs available to compute BERTScore for TriviaQA.")
+
     print(eval_dict)
