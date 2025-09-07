@@ -145,6 +145,9 @@ def main():
     preds_bin: List[int] = []
     gts_bin: List[int] = []
 
+    # Keep records in-memory so we can compute BERTScore afterwards (if available)
+    all_recs = []
+
     with open(args.output_file, "w", encoding="utf-8") as out_f:
         for ex in tqdm(ds, desc="Evaluating", unit="ex"):
             question = ex.get(input_col)
@@ -163,12 +166,16 @@ def main():
                 "label": gt,
                 "raw_output": gen
             }
+            # write to file (original behavior)
             out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            # store in-memory for BERT scoring later
+            all_recs.append(rec)
 
             if gt is not None:
                 preds_bin.append(1 if pred == "yes" else 0)
                 gts_bin.append(1 if gt == "yes" else 0)
 
+    # Original metrics calculation (unchanged behavior)
     if gts_bin:
         y_true = np.array(gts_bin)
         y_pred = np.array(preds_bin)
@@ -187,7 +194,58 @@ def main():
             "support": int(len(y_true))
         }
         print("\nMetrics:", json.dumps(metrics, indent=2))
-        with open(os.path.splitext(args.output_file)[0] + ".metrics.json", "w", encoding="utf-8") as mf:
+        metrics_path = os.path.splitext(args.output_file)[0] + ".metrics.json"
+
+        # --- BERTScore addition: compute BERT between raw_output and the normalized label when label exists ---
+        try:
+            # Import BERT scorer (deferred import so script still works if bert_score is absent)
+            try:
+                from bert_score.scorer import BERTScorer
+                berter = "scorer"
+            except Exception:
+                # fallback to score function
+                from bert_score import score as bert_score_func
+                berter = "func"
+        except Exception as e:
+            print("Warning: bert_score not available; skipping BERT scoring. Install with `pip install bert-score` to enable. Error:", e)
+            # write original metrics and exit
+            with open(metrics_path, "w", encoding="utf-8") as mf:
+                json.dump(metrics, mf, indent=2)
+            return
+
+        # prepare pairs where label exists
+        cand_texts = []
+        ref_texts = []
+        for r in all_recs:
+            if r.get("label") is None:
+                continue
+            # Use raw_output as candidate and the normalized label text as reference
+            cand_texts.append(r.get("raw_output", ""))
+            ref_texts.append(r.get("label", ""))
+
+        if cand_texts and ref_texts:
+            try:
+                if berter == "scorer":
+                    scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+                    P, R, F = scorer.score(cand_texts, ref_texts, verbose=False, batch_size=64)
+                else:
+                    P, R, F = bert_score_func(cand_texts, ref_texts, lang="en", verbose=False, batch_size=64)
+                # convert to floats; BERTScore outputs are in [0,1]
+                bert_p_mean = float(P.mean().item())
+                bert_r_mean = float(R.mean().item())
+                bert_f_mean = float(F.mean().item())
+                # Add to metrics (report as standard fraction 0..1)
+                metrics["bert_precision"] = round(bert_p_mean, 6)
+                metrics["bert_recall"] = round(bert_r_mean, 6)
+                metrics["bert_f1"] = round(bert_f_mean, 6)
+                print("BERTScore (mean) P/R/F:", metrics["bert_precision"], metrics["bert_recall"], metrics["bert_f1"])
+            except Exception as e:
+                print("Warning: BERT scoring failed:", e)
+        else:
+            print("No labeled examples with raw_output found — skipping BERT scoring for RAGTruth.")
+
+        # write metrics (original behavior + bert additions)
+        with open(metrics_path, "w", encoding="utf-8") as mf:
             json.dump(metrics, mf, indent=2)
     else:
         print("\nNo ground-truth labels found. Wrote predictions only to:", args.output_file)
