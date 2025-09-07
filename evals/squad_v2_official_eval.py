@@ -13,6 +13,7 @@ import os
 import re
 import string
 import sys
+import torch
 
 OPTS = None
 
@@ -301,11 +302,16 @@ def main():
     if cands and refs:
       try:
         if berter == "scorer":
-          scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+          # Force roberta-large
+          device = "cuda" if (hasattr(torch, 'cuda') and torch.cuda.is_available()) else "cpu"
+          scorer = BERTScorer(model_type="roberta-large", lang="en", idf=False, batch_size=64, use_fast_tokenizer=True, device=device)
           P, R, F = scorer.score(cands, refs, verbose=False, batch_size=64)
         else:
-          # bert_score.score supports refs as list[list[str]]
-          P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
+          # try functional API with model_type first, fall back to lang
+          try:
+            P, R, F = bert_score_func(cands, refs, model_type="roberta-large", verbose=False, batch_size=64)
+          except TypeError:
+            P, R, F = bert_score_func(cands, refs, lang="en", verbose=False, batch_size=64)
         bert_p_mean = float(P.mean().item())
         bert_r_mean = float(R.mean().item())
         bert_f_mean = float(F.mean().item())
