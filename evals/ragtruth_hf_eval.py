@@ -226,10 +226,16 @@ def main():
         if cand_texts and ref_texts:
             try:
                 if berter == "scorer":
-                    scorer = BERTScorer(lang="en", idf=False, batch_size=64, use_fast_tokenizer=True)
+                    # Force roberta-large
+                    device = "cuda" if (hasattr(torch, 'cuda') and torch.cuda.is_available()) else "cpu"
+                    scorer = BERTScorer(model_type="roberta-large", lang="en", idf=False, batch_size=64, use_fast_tokenizer=True, device=device)
                     P, R, F = scorer.score(cand_texts, ref_texts, verbose=False, batch_size=64)
                 else:
-                    P, R, F = bert_score_func(cand_texts, ref_texts, lang="en", verbose=False, batch_size=64)
+                    # functional API fallback: try to request roberta-large; if it doesn't accept model_type, call without it
+                    try:
+                        P, R, F = bert_score_func(cand_texts, ref_texts, model_type="roberta-large", verbose=False, batch_size=64)
+                    except TypeError:
+                        P, R, F = bert_score_func(cand_texts, ref_texts, lang="en", verbose=False, batch_size=64)
                 # convert to floats; BERTScore outputs are in [0,1]
                 bert_p_mean = float(P.mean().item())
                 bert_r_mean = float(R.mean().item())
