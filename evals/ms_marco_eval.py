@@ -154,8 +154,8 @@ def compute_metrics_from_files(p_path_to_reference_file,
         from bert_score.scorer import BERTScorer
         # pick device automatically
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # build scorer (defaults chosen to be robust)
-        scorer = BERTScorer(lang='en', device=device, idf=True, use_fast_tokenizer=True)
+        # build scorer (force roberta-large)
+        scorer = BERTScorer(model_type="roberta-large", lang='en', device=device, idf=True, use_fast_tokenizer=True)
         # compute idf over full reference pool (flatten)
         flat_refs = []
         for ref_list in refs_by_id:
