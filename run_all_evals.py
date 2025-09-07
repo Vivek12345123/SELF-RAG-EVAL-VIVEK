@@ -178,7 +178,7 @@ def run_crag(model, sampling_params, format_prompt, dataset_key="Quivr/CRAG", sp
         metrics = crag_mod.calculate_metrics(
             annotated_ds,
             pred_adherence="pred_adherence",
-            pred_context_releavance="pred_context_relevance",   # note: your CRAG code earlier had a typo; we'll pass this name
+            pred_context_relevance="pred_context_relevance",   # note: your CRAG code earlier had a typo; we'll pass this name
             pred_context_utilization="pred_context_utilization",
             # ground truth fields fallback: those should exist in the dataset rows, otherwise crag code will use defaults
         )
