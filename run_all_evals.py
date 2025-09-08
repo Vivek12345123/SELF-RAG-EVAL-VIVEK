@@ -31,6 +31,45 @@ import logging
 # --- Configurable globals ---
 MAX_SAMPLES = 200
 KEEP_INTERMEDIATES = False
+# Add this to your run_all_evals.py near the top with other globals
+
+# Updated dataset configurations to match your actual datasets
+DATASET_CONFIGS = {
+    "ragtruth": {
+        "name": "wandbRAGTruth-processed",  # Updated from "RAGTruth/ragtruth"
+        "config": None,
+        "split": "test"
+    },
+    "squad": {
+        "name": "rajpurkar/squad_v2", 
+        "config": None,
+        "split": "validation"
+    },
+    "hotpot": {
+        "name": "hotpotqa/hotpot_qa",
+        "config": "distractor", 
+        "split": "validation"
+    },
+    "msmarco": {
+        "name": "microsoft/ms_marco",
+        "config": "v2.1",
+        "split": "test"
+    },
+    "nq": {
+        "name": "google-research-datasets/natural_questions",
+        "config": "default",
+        "split": "validation" 
+    },
+    "trivia": {
+        "name": "mandarjoshi/trivia_qa",
+        "config": "rc",
+        "split": "test"
+    }
+}
+
+# Update your task runner calls to use these configs
+def get_dataset_config(task_name):
+    return DATASET_CONFIGS.get(task_name, {})
 
 # UPDATED: Use Self-RAG 7B model
 MODEL_NAME = "selfrag/selfrag_llama2_7b"
