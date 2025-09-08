@@ -733,16 +733,66 @@ def main():
             if mpath and os.path.exists(mpath):
                 with open(mpath, "r", encoding="utf-8") as fh:
                     try:
-                        metrics_summary[name] = json.load(fh)
-                    except Exception:
-                        metrics_summary[name] = {"_raw_metrics_file": str(mpath)}
-                        logging.warning(f"[main] {name} metrics exist but could not be parsed as JSON.")
+                        metrics_data = json.load(fh)
+                        metrics_summary[name] = metrics_data
+                        logging.info(f"[main] {name} metrics loaded successfully: {len(metrics_data)} metrics")
+                    except Exception as e:
+                        metrics_summary[name] = {"_raw_metrics_file": str(mpath), "_parse_error": str(e)}
+                        logging.warning(f"[main] {name} metrics exist but could not be parsed as JSON: {e}")
             else:
                 logging.warning(f"[main] {name} metrics not found. Check outputs/{name}/*_stderr.txt")
-                metrics_summary[name] = {"error": "metrics file not found"}
+                
+                # Try to find any metrics in stdout files
+                stdout_file = OUT_ROOT / name / f"{name}_stdout.txt"
+                if stdout_file.exists():
+                    try:
+                        stdout_content = stdout_file.read_text(encoding="utf-8")
+                        # Try to extract simple metrics from stdout
+                        extracted_metrics = extract_metrics_from_text(stdout_content)
+                        if extracted_metrics:
+                            metrics_summary[name] = extracted_metrics
+                            logging.info(f"[main] {name} metrics extracted from stdout")
+                        else:
+                            metrics_summary[name] = {"error": "metrics file not found", "stdout_checked": True}
+                    except Exception:
+                        metrics_summary[name] = {"error": "metrics file not found"}
+                else:
+                    metrics_summary[name] = {"error": "metrics file not found"}
         except Exception as e:
             logging.exception(f"[main] Exception while running {name}: {e}")
             metrics_summary[name] = {"error": str(e)}
+
+def extract_metrics_from_text(text: str) -> dict:
+    """Extract metrics from plain text output (last resort)."""
+    metrics = {}
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Look for common metric patterns
+        patterns = [
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*%?)',
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*)',
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s+([0-9]+\.?[0-9]*%?)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, line, re.IGNORECASE)
+            for key, value in matches:
+                key = key.lower().replace('-', '_')
+                try:
+                    # Convert percentage to decimal
+                    if value.endswith('%'):
+                        metrics[key] = float(value[:-1])
+                    else:
+                        metrics[key] = float(value)
+                except ValueError:
+                    metrics[key] = value
+                    
+    return metrics
 
     if "ragtruth" in tasks:
         logging.info("[main] Running RAGTruth")
