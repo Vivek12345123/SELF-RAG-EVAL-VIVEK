@@ -649,16 +649,10 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
     if trivia_gold_path:
         script = resolve_script("trivia")
         limited_gold_file = limit_gold_file(trivia_gold_path)
-        metrics_path = out_dir / "trivia_metrics.json"
-        try:
-            script_text = open(script, "r", encoding="utf-8").read()
-        except Exception:
-            script_text = ""
-        if "--out-file" in script_text or "--out_file" in script_text:
-            cmd = [str(script), "--dataset_file", limited_gold_file, "--prediction_file", str(pred_file), "--out-file", str(metrics_path)]
-        else:
-            cmd = [str(script), "--dataset_file", limited_gold_file, "--prediction_file", str(pred_file)]
-        metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[metrics_path], metrics_basename=metrics_path.name, task_name="trivia")
+        
+        # FIXED: TriviaQA eval prints to stdout, doesn't support --out-file
+        cmd = [str(script), "--dataset_file", limited_gold_file, "--prediction_file", str(pred_file)]
+        metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[], metrics_basename="trivia_metrics.json", task_name="trivia")
 
         if not keep_intermediates:
             for p in (pred_file, limited_gold_file):
