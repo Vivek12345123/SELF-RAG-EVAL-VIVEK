@@ -3,7 +3,7 @@
 run_all_evals.py
 
 Unified runner that:
- - Loads Self-RAG via vLLM
+ - Loads Self-RAG 7B via vLLM
  - Starts a tiny TGI-compatible adapter for RAGTruth
  - Generates predictions for several datasets and calls the official
    evaluation scripts (unchanged) as subprocesses (invoked with same
@@ -32,7 +32,8 @@ import logging
 MAX_SAMPLES = 200
 KEEP_INTERMEDIATES = False
 
-MODEL_NAME = "selfrag/selfrag_llama2_13b"
+# UPDATED: Use Self-RAG 7B model
+MODEL_NAME = "selfrag/selfrag_llama2_7b"
 MODEL_CACHE_DIR = "/gscratch/h2lab/akari/model_cache"
 DEFAULT_TGI_HOST = "127.0.0.1"
 DEFAULT_TGI_PORT = 8300
@@ -59,7 +60,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 GLOBAL_TOKENIZER = None
 # Conservative model max tokens (adjust if your model supports a different context)
 DEFAULT_MODEL_MAX_TOKENS = 4096
-
 
 # --- Helpers -----------------------------------------------------------------
 def bytes_to_gb(b): return b / (1024 ** 3)
@@ -290,15 +290,19 @@ def load_model_and_tokenizer(model_name: str = MODEL_NAME, cache_dir: str = MODE
     try:
         from vllm import LLM, SamplingParams
         model = LLM(model_name, download_dir=cache_dir, dtype="half")
-        sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=128, skip_special_tokens=False)
+        # UPDATED: Use Self-RAG specific sampling parameters
+        sampling_params = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=100, skip_special_tokens=False)
     except Exception as e:
         logging.error(f"[model] vLLM LLM load failed: {e}")
         raise
+    
+    # UPDATED: Use Self-RAG specific prompt format
     def format_prompt(input_text: str, paragraph: Optional[str] = None):
-        prompt = f"### Instruction:\n{input_text}\n\n### Response:\n"
+        prompt = "### Instruction:\n{0}\n\n### Response:\n".format(input_text)
         if paragraph is not None:
-            prompt += f"[Retrieval]<paragraph>{paragraph}</paragraph>"
+            prompt += "[Retrieval]<paragraph>{0}</paragraph>".format(paragraph)
         return prompt
+    
     return model, tokenizer, sampling_params, format_prompt
 
 # --- Task runners -----------------------------------------------------------
@@ -333,7 +337,7 @@ def run_squad_v2(model, sampling_params, format_prompt, dataset_key="rajpurkar/s
         json.dump(data_json, fh)
     pred_file = out_dir / "preds.json"
     from vllm import SamplingParams as VSamplingParams
-    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=True)
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
     preds = {}
     logging.info(f"[squad] Generating answers for {len(qlist)} examples (batch {batch_size})")
     for i in range(0, len(qlist), batch_size):
@@ -344,6 +348,8 @@ def run_squad_v2(model, sampling_params, format_prompt, dataset_key="rajpurkar/s
         outs = model.generate(prompts, sp)
         for j, out in enumerate(outs):
             text = (out.outputs[0].text or "").strip()
+            # Post-process Self-RAG output to extract clean answer
+            text = clean_selfrag_output(text)
             qid = batch[j][0]
             preds[qid] = text
     with open(pred_file, "w", encoding="utf-8") as fh:
@@ -376,7 +382,7 @@ def run_hotpot(model, sampling_params, format_prompt, dataset_key="hotpotqa/hotp
     ds = ds.select(range(min(MAX_SAMPLES, len(ds))))
     preds = {"answer": {}, "sp": {}}
     from vllm import SamplingParams as VSamplingParams
-    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=True)
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
     qlist = []
     for ex in ds:
         qid = ex.get("_id") or ex.get("id") or str(len(qlist))
@@ -398,6 +404,8 @@ def run_hotpot(model, sampling_params, format_prompt, dataset_key="hotpotqa/hotp
         outs = model.generate(prompts, sp)
         for j, out in enumerate(outs):
             ans = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            ans = clean_selfrag_output(ans)
             qid = batch[j][0]
             preds["answer"][qid] = ans
             preds["sp"][qid] = []
@@ -472,7 +480,7 @@ def run_ms_marco(model, sampling_params, format_prompt, dataset_key="microsoft/m
         for rec in references:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     from vllm import SamplingParams as VSamplingParams
-    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=True)
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
     candidates = []
     logging.info(f"[msmarco] Generating answers for {len(queries)} queries (batch {batch_size})")
     for i in range(0, len(queries), batch_size):
@@ -482,6 +490,8 @@ def run_ms_marco(model, sampling_params, format_prompt, dataset_key="microsoft/m
         outs = model.generate(prompts, sp)
         for j, out in enumerate(outs):
             text = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            text = clean_selfrag_output(text)
             qid = batch[j][0]
             candidates.append({"query_id": qid, "answers": [text if text else ""]})
     with open(cand_path, "w", encoding="utf-8") as fh:
@@ -572,7 +582,7 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
             prompt_text += f"\n\nContext: {context}"
         qlist.append((str(qid), prompt_text))
     from vllm import SamplingParams as VSamplingParams
-    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=True)
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
     preds = {}
     logging.info(f"[trivia] Generating {len(qlist)} predictions (batch {batch_size})")
     for i in range(0, len(qlist), batch_size):
@@ -582,6 +592,8 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
         outs = model.generate(prompts, sp)
         for j, out in enumerate(outs):
             ans = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            ans = clean_selfrag_output(ans)
             qid = batch[j][0]
             preds[qid] = ans
     pred_file = out_dir / "trivia_preds.json"
@@ -615,6 +627,42 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
         logging.info("[trivia] No trivia gold path provided; predictions saved.")
         return None
 
+# --- Self-RAG Output Cleaning Helper ---
+def clean_selfrag_output(text: str) -> str:
+    """
+    Clean Self-RAG output by removing special tokens and extracting the core answer.
+    Self-RAG outputs contain special tokens like [Retrieval], [Relevant], [Fully supported], etc.
+    """
+    if not text:
+        return ""
+    
+    # Remove Self-RAG special tokens
+    import re
+    
+    # Common Self-RAG special tokens to remove
+    selfrag_tokens = [
+        r'\[Retrieval\]',
+        r'\[No Retrieval\]',
+        r'\[Relevant\]',
+        r'\[Irrelevant\]', 
+        r'\[Partially supported\]',
+        r'\[Fully supported\]',
+        r'\[No support / Contradictory\]',
+        r'\[Utility:\d+\]',
+        r'<paragraph>.*?</paragraph>',
+        r'</s>',
+        r'<s>',
+    ]
+    
+    cleaned = text
+    for token_pattern in selfrag_tokens:
+        cleaned = re.sub(token_pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
+
 # --- CLI --------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
@@ -626,7 +674,7 @@ def parse_args():
     p.add_argument("--tgi-port", type=int, default=DEFAULT_TGI_PORT)
     p.add_argument("--run", type=str, default="all", help="Comma-separated list of tasks: ragtruth,squad,hotpot,msmarco,nq,trivia or 'all'")
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--max-tokens", type=int, default=100)  # Updated to match Self-RAG default
     p.add_argument("--temp", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--nq-predictions", type=str, default=None)
@@ -698,28 +746,59 @@ def main():
 
     if "ragtruth" in tasks:
         logging.info("[main] Running RAGTruth")
+        ragtruth_samples = get_task_max_samples("ragtruth", args)
+        logging.info(f"[main] RAGTruth using {ragtruth_samples} samples")
         out_file = OUT_ROOT / "ragtruth_preds.jsonl"
+        # Temporarily set MAX_SAMPLES for this task
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = ragtruth_samples
         run_task_safely("ragtruth", run_ragtruth_adapter_and_eval, args.tgi_host, args.tgi_port, "wandb/RAGTruth-processed", None, "test", str(out_file), "", model, sampling_params, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     if "squad" in tasks:
         logging.info("[main] Running SQuAD v2")
+        squad_samples = get_task_max_samples("squad", args)
+        logging.info(f"[main] SQuAD v2 using {squad_samples} samples")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = squad_samples
         run_task_safely("squad_v2", run_squad_v2, model, sampling_params, format_prompt, "rajpurkar/squad_v2", args.squad_split, OUT_ROOT/"squad_v2", args.batch_size, args.max_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     if "hotpot" in tasks:
         logging.info("[main] Running HotPotQA")
+        hotpot_samples = get_task_max_samples("hotpot", args)
+        logging.info(f"[main] HotPotQA using {hotpot_samples} samples")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = hotpot_samples
         run_task_safely("hotpot", run_hotpot, model, sampling_params, format_prompt, "hotpotqa/hotpot_qa", args.hotpot_split, OUT_ROOT/"hotpot", args.batch_size, args.max_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     if "msmarco" in tasks:
         logging.info("[main] Running MS MARCO")
+        msmarco_samples = get_task_max_samples("msmarco", args)
+        logging.info(f"[main] MS MARCO using {msmarco_samples} samples")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = msmarco_samples
         run_task_safely("msmarco", run_ms_marco, model, sampling_params, format_prompt, "microsoft/ms_marco", args.msmarco_config, args.msmarco_split, OUT_ROOT/"ms_marco", args.batch_size, args.max_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     if "nq" in tasks:
         logging.info("[main] Running Natural Questions")
+        nq_samples = get_task_max_samples("nq", args)
+        logging.info(f"[main] Natural Questions using {nq_samples} samples")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = nq_samples
         run_task_safely("nq", run_natural_questions, OUT_ROOT/"nq", None, args.nq_split, args.nq_predictions, args.nq_empty, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     if "trivia" in tasks:
         logging.info("[main] Running TriviaQA")
+        trivia_samples = get_task_max_samples("trivia", args)
+        logging.info(f"[main] TriviaQA using {trivia_samples} samples")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = trivia_samples
         run_task_safely("trivia", run_triviaqa, model, sampling_params, format_prompt, "mandarjoshi/trivia_qa", args.trivia_split, OUT_ROOT/"trivia", args.batch_size, args.max_tokens, args.temp, args.top_p, args.trivia_gold, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
 
     # aggregate summary
     summary_path = OUT_ROOT / "all_eval_scores.json"
