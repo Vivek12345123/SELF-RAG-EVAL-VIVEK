@@ -33,43 +33,6 @@ MAX_SAMPLES = 200
 KEEP_INTERMEDIATES = False
 # Add this to your run_all_evals.py near the top with other globals
 
-# Updated dataset configurations to match your actual datasets
-DATASET_CONFIGS = {
-    "ragtruth": {
-        "name": "wandbRAGTruth-processed",  # Updated from "RAGTruth/ragtruth"
-        "config": None,
-        "split": "test"
-    },
-    "squad": {
-        "name": "rajpurkar/squad_v2", 
-        "config": None,
-        "split": "validation"
-    },
-    "hotpot": {
-        "name": "hotpotqa/hotpot_qa",
-        "config": "distractor", 
-        "split": "validation"
-    },
-    "msmarco": {
-        "name": "microsoft/ms_marco",
-        "config": "v2.1",
-        "split": "test"
-    },
-    "nq": {
-        "name": "google-research-datasets/natural_questions",
-        "config": "default",
-        "split": "validation" 
-    },
-    "trivia": {
-        "name": "mandarjoshi/trivia_qa",
-        "config": "rc",
-        "split": "test"
-    }
-}
-
-# Update your task runner calls to use these configs
-def get_dataset_config(task_name):
-    return DATASET_CONFIGS.get(task_name, {})
 
 # UPDATED: Use Self-RAG 7B model
 MODEL_NAME = "selfrag/selfrag_llama2_7b"
@@ -931,7 +894,7 @@ def main():
             "msmarco": ("microsoft/ms_marco", "v2.1", "test"),
             "nq": ("google-research-datasets/natural_questions", "default", "validation"),
             "trivia": ("mandarjoshi/trivia_qa", "rc", "test"),
-            "ragtruth": ("wandbRAGTruth-processed", None, "test"),  # Updated
+            "ragtruth": ("wandbRAGTruth-processed", None, "test"),
             "squad": ("rajpurkar/squad_v2", None, "validation"),
         }
         for k, (dsid, cfg, split) in hf_tasks.items():
@@ -944,8 +907,39 @@ def main():
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     metrics_summary = {}
 
-    # ... (keep the run_task_safely function as is) ...
+    def run_task_safely(name, fn, *args, **kwargs):
+        try:
+            mpath = fn(*args, **kwargs)
+            if mpath and os.path.exists(mpath):
+                with open(mpath, "r", encoding="utf-8") as fh:
+                    try:
+                        metrics_data = json.load(fh)
+                        metrics_summary[name] = metrics_data
+                        logging.info(f"[main] {name} metrics loaded successfully: {len(metrics_data)} metrics")
+                    except Exception as e:
+                        metrics_summary[name] = {"_raw_metrics_file": str(mpath), "_parse_error": str(e)}
+                        logging.warning(f"[main] {name} metrics exist but could not be parsed as JSON: {e}")
+            else:
+                logging.warning(f"[main] {name} metrics not found. Check outputs/{name}/*_stderr.txt")
+                stdout_file = OUT_ROOT / name / f"{name}_stdout.txt"
+                if stdout_file.exists():
+                    try:
+                        stdout_content = stdout_file.read_text(encoding="utf-8")
+                        extracted_metrics = extract_metrics_from_text(stdout_content)
+                        if extracted_metrics:
+                            metrics_summary[name] = extracted_metrics
+                            logging.info(f"[main] {name} metrics extracted from stdout")
+                        else:
+                            metrics_summary[name] = {"error": "metrics file not found", "stdout_checked": True}
+                    except Exception:
+                        metrics_summary[name] = {"error": "metrics file not found"}
+                else:
+                    metrics_summary[name] = {"error": "metrics file not found"}
+        except Exception as e:
+            logging.exception(f"[main] Exception while running {name}: {e}")
+            metrics_summary[name] = {"error": str(e)}
 
+    # Run tasks using the corrected dataset configurations
     if "ragtruth" in tasks:
         logging.info("[main] Running RAGTruth")
         ragtruth_samples = get_task_max_samples("ragtruth", args)
@@ -955,7 +949,6 @@ def main():
         out_file = OUT_ROOT / "ragtruth_preds.jsonl"
         old_max = MAX_SAMPLES
         MAX_SAMPLES = ragtruth_samples
-        # Updated dataset name
         run_task_safely("ragtruth", run_ragtruth_adapter_and_eval, args.tgi_host, args.tgi_port, "wandbRAGTruth-processed", None, "test", str(out_file), "", model, sampling_params, KEEP_INTERMEDIATES)
         MAX_SAMPLES = old_max
 
@@ -992,7 +985,6 @@ def main():
         logging.info(f"[main] MS MARCO using {msmarco_samples} samples, {msmarco_tokens} tokens, batch_size={msmarco_batch_size}")
         old_max = MAX_SAMPLES
         MAX_SAMPLES = msmarco_samples
-        # Updated config to match your dataset
         run_task_safely("msmarco", run_ms_marco, model, sampling_params, format_prompt, "microsoft/ms_marco", "v2.1", "test", OUT_ROOT/"ms_marco", msmarco_batch_size, msmarco_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
         MAX_SAMPLES = old_max
 
@@ -1002,7 +994,6 @@ def main():
         logging.info(f"[main] Natural Questions using {nq_samples} samples")
         old_max = MAX_SAMPLES
         MAX_SAMPLES = nq_samples
-        # Updated dataset name and config
         run_task_safely("nq", run_natural_questions, OUT_ROOT/"nq", "google-research-datasets/natural_questions", "validation", args.nq_predictions, args.nq_empty, KEEP_INTERMEDIATES)
         MAX_SAMPLES = old_max
 
@@ -1014,110 +1005,7 @@ def main():
         logging.info(f"[main] TriviaQA using {trivia_samples} samples, {trivia_tokens} tokens, batch_size={trivia_batch_size}")
         old_max = MAX_SAMPLES
         MAX_SAMPLES = trivia_samples
-        # Updated split to test
         run_task_safely("trivia", run_triviaqa, model, sampling_params, format_prompt, "mandarjoshi/trivia_qa", "test", OUT_ROOT/"trivia", trivia_batch_size, trivia_tokens, args.temp, args.top_p, args.trivia_gold, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    # ... (rest of the function remains the same) ...
-
-    def run_task_safely(name, fn, *args, **kwargs):
-        try:
-            mpath = fn(*args, **kwargs)
-            if mpath and os.path.exists(mpath):
-                with open(mpath, "r", encoding="utf-8") as fh:
-                    try:
-                        metrics_data = json.load(fh)
-                        metrics_summary[name] = metrics_data
-                        logging.info(f"[main] {name} metrics loaded successfully: {len(metrics_data)} metrics")
-                    except Exception as e:
-                        metrics_summary[name] = {"_raw_metrics_file": str(mpath), "_parse_error": str(e)}
-                        logging.warning(f"[main] {name} metrics exist but could not be parsed as JSON: {e}")
-            else:
-                logging.warning(f"[main] {name} metrics not found. Check outputs/{name}/*_stderr.txt")
-                stdout_file = OUT_ROOT / name / f"{name}_stdout.txt"
-                if stdout_file.exists():
-                    try:
-                        stdout_content = stdout_file.read_text(encoding="utf-8")
-                        extracted_metrics = extract_metrics_from_text(stdout_content)
-                        if extracted_metrics:
-                            metrics_summary[name] = extracted_metrics
-                            logging.info(f"[main] {name} metrics extracted from stdout")
-                        else:
-                            metrics_summary[name] = {"error": "metrics file not found", "stdout_checked": True}
-                    except Exception:
-                        metrics_summary[name] = {"error": "metrics file not found"}
-                else:
-                    metrics_summary[name] = {"error": "metrics file not found"}
-        except Exception as e:
-            logging.exception(f"[main] Exception while running {name}: {e}")
-            metrics_summary[name] = {"error": str(e)}
-
-    if "ragtruth" in tasks:
-        logging.info("[main] Running RAGTruth")
-        ragtruth_samples = get_task_max_samples("ragtruth", args)
-        ragtruth_tokens = get_task_max_tokens("ragtruth", args)
-        ragtruth_batch_size = get_task_batch_size("ragtruth", args)
-        logging.info(f"[main] RAGTruth using {ragtruth_samples} samples, {ragtruth_tokens} tokens, batch_size={ragtruth_batch_size}")
-        out_file = OUT_ROOT / "ragtruth_preds.jsonl"
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = ragtruth_samples
-        run_task_safely("ragtruth", run_ragtruth_adapter_and_eval, args.tgi_host, args.tgi_port, "RAGTruth/ragtruth", None, "test", str(out_file), "", model, sampling_params, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    if "squad" in tasks:
-        logging.info("[main] Running SQuAD v2")
-        squad_samples = get_task_max_samples("squad", args)
-        squad_tokens = get_task_max_tokens("squad", args)
-        squad_batch_size = get_task_batch_size("squad", args)
-        logging.info(f"[main] SQuAD v2 using {squad_samples} samples, {squad_tokens} tokens, batch_size={squad_batch_size}")
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = squad_samples
-        if args.calculate_bert:
-            run_task_safely("squad_v2", run_squad_v2_with_bert, model, sampling_params, format_prompt, "rajpurkar/squad_v2", args.squad_split, OUT_ROOT/"squad_v2", squad_batch_size, squad_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
-        else:
-            run_task_safely("squad_v2", run_squad_v2, model, sampling_params, format_prompt, "rajpurkar/squad_v2", args.squad_split, OUT_ROOT/"squad_v2", squad_batch_size, squad_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    if "hotpot" in tasks:
-        logging.info("[main] Running HotPotQA")
-        hotpot_samples = get_task_max_samples("hotpot", args)
-        hotpot_tokens = get_task_max_tokens("hotpot", args)
-        hotpot_batch_size = get_task_batch_size("hotpot", args)
-        logging.info(f"[main] HotPotQA using {hotpot_samples} samples, {hotpot_tokens} tokens, batch_size={hotpot_batch_size}")
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = hotpot_samples
-        run_task_safely("hotpot", run_hotpot, model, sampling_params, format_prompt, "hotpotqa/hotpot_qa", args.hotpot_split, OUT_ROOT/"hotpot", hotpot_batch_size, hotpot_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    if "msmarco" in tasks:
-        logging.info("[main] Running MS MARCO")
-        msmarco_samples = get_task_max_samples("msmarco", args)
-        msmarco_tokens = get_task_max_tokens("msmarco", args)
-        msmarco_batch_size = get_task_batch_size("msmarco", args)
-        logging.info(f"[main] MS MARCO using {msmarco_samples} samples, {msmarco_tokens} tokens, batch_size={msmarco_batch_size}")
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = msmarco_samples
-        run_task_safely("msmarco", run_ms_marco, model, sampling_params, format_prompt, "microsoft/ms_marco", args.msmarco_config, args.msmarco_split, OUT_ROOT/"ms_marco", msmarco_batch_size, msmarco_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    if "nq" in tasks:
-        logging.info("[main] Running Natural Questions")
-        nq_samples = get_task_max_samples("nq", args)
-        logging.info(f"[main] Natural Questions using {nq_samples} samples")
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = nq_samples
-        run_task_safely("nq", run_natural_questions, OUT_ROOT/"nq", None, args.nq_split, args.nq_predictions, args.nq_empty, KEEP_INTERMEDIATES)
-        MAX_SAMPLES = old_max
-
-    if "trivia" in tasks:
-        logging.info("[main] Running TriviaQA")
-        trivia_samples = get_task_max_samples("trivia", args)
-        trivia_tokens = get_task_max_tokens("trivia", args)
-        trivia_batch_size = get_task_batch_size("trivia", args)
-        logging.info(f"[main] TriviaQA using {trivia_samples} samples, {trivia_tokens} tokens, batch_size={trivia_batch_size}")
-        old_max = MAX_SAMPLES
-        MAX_SAMPLES = trivia_samples
-        run_task_safely("trivia", run_triviaqa, model, sampling_params, format_prompt, "mandarjoshi/trivia_qa", args.trivia_split, OUT_ROOT/"trivia", trivia_batch_size, trivia_tokens, args.temp, args.top_p, args.trivia_gold, KEEP_INTERMEDIATES)
         MAX_SAMPLES = old_max
 
     # aggregate summary
