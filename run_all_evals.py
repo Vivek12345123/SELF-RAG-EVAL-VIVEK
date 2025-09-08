@@ -713,18 +713,38 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
         logging.info("[trivia] No trivia gold path provided; predictions saved.")
         return None
 
+# Replace your run_natural_questions function with this corrected version:
+
 def run_natural_questions(out_dir=OUT_ROOT / "nq", dataset_key: Optional[str]=None, split: Optional[str]=None, predictions_path: Optional[str]=None, make_empty=False, keep_intermediates: bool = False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     from datasets import load_dataset
+    
+    # Use corrected dataset configuration
     dsid = dataset_key or "google-research-datasets/natural_questions"
-    cfg = "default" if "google-research-datasets/natural_questions" in dsid else None
+    cfg = "default"  # Always use default config for this dataset
     split_to_use = split or "validation"
+    
     logging.info("[nq] Loading dataset %s config=%s split=%s", dsid, cfg, split_to_use)
-    ds = load_dataset(dsid, cfg, split=split_to_use) if cfg else load_dataset(dsid, split=split_to_use)
+    
+    try:
+        # Load with explicit config
+        ds = load_dataset(dsid, cfg, split=split_to_use)
+    except Exception as e:
+        logging.error("[nq] Failed to load dataset %s with config %s: %s", dsid, cfg, e)
+        # Try without config as fallback
+        try:
+            logging.info("[nq] Trying without config...")
+            ds = load_dataset(dsid, split=split_to_use)
+        except Exception as e2:
+            logging.error("[nq] Also failed without config: %s", e2)
+            raise e2
+    
     ds = ds.select(range(min(MAX_SAMPLES, len(ds))))
     gold_path = out_dir / "nq_gold.json"
+    
     with open(gold_path, "w", encoding="utf-8") as fh:
         json.dump([ex for ex in ds], fh)
+    
     pred_path = predictions_path
     if pred_path is None and make_empty:
         pred_path = out_dir / "nq_empty_preds.json"
@@ -734,20 +754,24 @@ def run_natural_questions(out_dir=OUT_ROOT / "nq", dataset_key: Optional[str]=No
             preds[str(ex_id)] = {}
         with open(pred_path, "w", encoding="utf-8") as fh:
             json.dump(preds, fh)
+    
     if pred_path is None:
         logging.info("[nq] No predictions provided. Skipping official NQ eval. Provide --nq-predictions to run official script.")
         return None
 
     script = resolve_script("nq")
     metrics_path = out_dir / "nq_metrics.json"
+    
     try:
         script_text = open(script, "r", encoding="utf-8").read()
     except Exception:
         script_text = ""
+    
     if "--out_file" in script_text or "--out-file" in script_text:
         cmd = [str(script), f"--gold_path={gold_path}", f"--predictions_path={pred_path}", f"--out_file={metrics_path}"]
     else:
         cmd = [str(script), f"--gold_path={gold_path}", f"--predictions_path={pred_path}"]
+    
     metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[metrics_path], metrics_basename=metrics_path.name, task_name="nq")
 
     if not keep_intermediates:
