@@ -61,6 +61,14 @@ GLOBAL_TOKENIZER = None
 # Conservative model max tokens (adjust if your model supports a different context)
 DEFAULT_MODEL_MAX_TOKENS = 4096
 
+# --- MISSING FUNCTION ADDED ---
+def get_task_max_samples(task_name: str, args) -> int:
+    """
+    Get max samples for a specific task, using args.max_examples if provided,
+    otherwise DEFAULT MAX_SAMPLES
+    """
+    return args.max_examples if args.max_examples is not None else MAX_SAMPLES
+
 # --- Helpers -----------------------------------------------------------------
 def bytes_to_gb(b): return b / (1024 ** 3)
 def check_disk_space(path="."):
@@ -305,6 +313,75 @@ def load_model_and_tokenizer(model_name: str = MODEL_NAME, cache_dir: str = MODE
     
     return model, tokenizer, sampling_params, format_prompt
 
+# --- Self-RAG Output Cleaning Helper ---
+def clean_selfrag_output(text: str) -> str:
+    """
+    Clean Self-RAG output by removing special tokens and extracting the core answer.
+    Self-RAG outputs contain special tokens like [Retrieval], [Relevant], [Fully supported], etc.
+    """
+    if not text:
+        return ""
+    
+    # Remove Self-RAG special tokens
+    import re
+    
+    # Common Self-RAG special tokens to remove
+    selfrag_tokens = [
+        r'\[Retrieval\]',
+        r'\[No Retrieval\]',
+        r'\[Relevant\]',
+        r'\[Irrelevant\]', 
+        r'\[Partially supported\]',
+        r'\[Fully supported\]',
+        r'\[No support / Contradictory\]',
+        r'\[Utility:\d+\]',
+        r'<paragraph>.*?</paragraph>',
+        r'</s>',
+        r'<s>',
+    ]
+    
+    cleaned = text
+    for token_pattern in selfrag_tokens:
+        cleaned = re.sub(token_pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
+
+# --- Metrics extraction helper ---
+def extract_metrics_from_text(text: str) -> dict:
+    """Extract metrics from plain text output (last resort)."""
+    metrics = {}
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Look for common metric patterns
+        patterns = [
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*%?)',
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*)',
+            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s+([0-9]+\.?[0-9]*%?)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, line, re.IGNORECASE)
+            for key, value in matches:
+                key = key.lower().replace('-', '_')
+                try:
+                    # Convert percentage to decimal
+                    if value.endswith('%'):
+                        metrics[key] = float(value[:-1])
+                    else:
+                        metrics[key] = float(value)
+                except ValueError:
+                    metrics[key] = value
+                    
+    return metrics
+
 # --- Task runners -----------------------------------------------------------
 # Each runner returns path to a JSON metrics file or None. They are robust
 # (write stdout/stderr, keep intermediates when requested) and use the splits
@@ -460,6 +537,13 @@ def run_ragtruth_adapter_and_eval(tgi_host: str, tgi_port: int, dataset_name: st
 
 def run_ms_marco(model, sampling_params, format_prompt, dataset_key="microsoft/ms_marco", dataset_config="v2.1", split="test", out_dir=OUT_ROOT / "ms_marco", batch_size=8, max_tokens=64, temp=0.0, top_p=1.0, keep_intermediates: bool = False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # SAFETY CHECK: Ensure max_tokens doesn't exceed model capacity
+    safe_max_tokens = min(max_tokens, DEFAULT_MODEL_MAX_TOKENS - 100)
+    if safe_max_tokens != max_tokens:
+        logging.warning(f"[msmarco] Reduced max_tokens from {max_tokens} to {safe_max_tokens} for safety")
+        max_tokens = safe_max_tokens
+    
     from datasets import load_dataset
     logging.info("[msmarco] Loading dataset %s config=%s split=%s", dataset_key, dataset_config, split)
     ds = load_dataset(dataset_key, dataset_config, split=split)
@@ -474,6 +558,119 @@ def run_ms_marco(model, sampling_params, format_prompt, dataset_key="microsoft/m
             answers = [str(answers)]
         references.append({"query_id": qid, "answers": answers if answers else [""]})
         queries.append((qid, query))
+    ref_path = out_dir / "msmarco_references.jsonl"
+    cand_path = out_dir / "msmarco_candidates.jsonl"
+    with open(ref_path, "w", encoding="utf-8") as fh:
+        for rec in references:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    from vllm import SamplingParams as VSamplingParams
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
+    candidates = []
+    logging.info(f"[msmarco] Generating answers for {len(queries)} queries (batch {batch_size})")
+    for i in range(0, len(queries), batch_size):
+        batch = queries[i:i+batch_size]
+        max_input_tokens = DEFAULT_MODEL_MAX_TOKENS - max_tokens - 100
+        prompts = [truncate_prompt(format_prompt(f"Answer the query: {q}", paragraph=None), max_input_tokens) for (_id, q) in batch]
+        outs = model.generate(prompts, sp)
+        for j, out in enumerate(outs):
+            text = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            text = clean_selfrag_output(text)
+            qid = batch[j][0]
+            candidates.append({"query_id": qid, "answers": [text if text else ""]})
+    with open(cand_path, "w", encoding="utf-8") as fh:
+        for rec in candidates:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    script = resolve_script("msmarco")
+    metrics_path = out_dir / "msmarco_metrics.json"
+    try:
+        script_text = open(script, "r", encoding="utf-8").read()
+    except Exception:
+        script_text = ""
+    if "--out-file" in script_text or "--out_file" in script_text:
+        cmd = [str(script), str(ref_path), str(cand_path), "--out-file", str(metrics_path)]
+    else:
+        cmd = [str(script), str(ref_path), str(cand_path)]
+    metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[metrics_path], metrics_basename=metrics_path.name, task_name="msmarco")
+
+    if not keep_intermediates:
+        for p in (ref_path, cand_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+    return metrics_found
+
+def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi/trivia_qa", split="test", out_dir=OUT_ROOT / "trivia", batch_size=8, max_tokens=64, temp=0.0, top_p=1.0, trivia_gold_path: Optional[str]=None, keep_intermediates: bool = False):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # SAFETY CHECK: Ensure max_tokens doesn't exceed model capacity
+    safe_max_tokens = min(max_tokens, DEFAULT_MODEL_MAX_TOKENS - 100)
+    if safe_max_tokens != max_tokens:
+        logging.warning(f"[trivia] Reduced max_tokens from {max_tokens} to {safe_max_tokens} for safety")
+        max_tokens = safe_max_tokens
+    
+    from datasets import load_dataset
+    logging.info("[trivia] Loading dataset %s split=%s (config rc)", dataset_key, split)
+    # Force the 'rc' config as requested
+    ds = load_dataset(dataset_key, "rc", split=split)
+    ds = ds.select(range(min(MAX_SAMPLES, len(ds))))
+    qlist = []
+    for ex in ds:
+        qid = ex.get("question_id") or ex.get("id") or ex.get("q_id") or ex.get("example_id") or str(len(qlist))
+        question = ex.get("question") or ex.get("query") or ex.get("text") or ""
+        context = ex.get("search_results") or ex.get("context") or None
+        prompt_text = f"Answer the trivia question: {question}"
+        if context:
+            prompt_text += f"\n\nContext: {context}"
+        qlist.append((str(qid), prompt_text))
+    from vllm import SamplingParams as VSamplingParams
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
+    preds = {}
+    logging.info(f"[trivia] Generating {len(qlist)} predictions (batch {batch_size})")
+    for i in range(0, len(qlist), batch_size):
+        batch = qlist[i:i+batch_size]
+        max_input_tokens = DEFAULT_MODEL_MAX_TOKENS - max_tokens - 100
+        prompts = [truncate_prompt(format_prompt(t, paragraph=None), max_input_tokens) for (_id,t) in batch]
+        outs = model.generate(prompts, sp)
+        for j, out in enumerate(outs):
+            ans = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            ans = clean_selfrag_output(ans)
+            qid = batch[j][0]
+            preds[qid] = ans
+    pred_file = out_dir / "trivia_preds.json"
+    with open(pred_file, "w", encoding="utf-8") as fh:
+        json.dump(preds, fh)
+    logging.info("[trivia] Wrote predictions")
+
+    if trivia_gold_path:
+        script = resolve_script("trivia")
+        limited_gold_file = limit_gold_file(trivia_gold_path)
+        metrics_path = out_dir / "trivia_metrics.json"
+        try:
+            script_text = open(script, "r", encoding="utf-8").read()
+        except Exception:
+            script_text = ""
+        if "--out-file" in script_text or "--out_file" in script_text:
+            cmd = [str(script), "--dataset_file", limited_gold_file, "--prediction_file", str(pred_file), "--out-file", str(metrics_path)]
+        else:
+            cmd = [str(script), "--dataset_file", limited_gold_file, "--prediction_file", str(pred_file)]
+        metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[metrics_path], metrics_basename=metrics_path.name, task_name="trivia")
+
+        if not keep_intermediates:
+            for p in (pred_file, limited_gold_file):
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+        return metrics_found
+    else:
+        logging.info("[trivia] No trivia gold path provided; predictions saved.")
+        return Nonequeries.append((qid, query))
     ref_path = out_dir / "msmarco_references.jsonl"
     cand_path = out_dir / "msmarco_candidates.jsonl"
     with open(ref_path, "w", encoding="utf-8") as fh:
@@ -565,8 +762,83 @@ def run_natural_questions(out_dir=OUT_ROOT / "nq", dataset_key: Optional[str]=No
                 pass
     return metrics_found
 
+def run_ms_marco(model, sampling_params, format_prompt, dataset_key="microsoft/ms_marco", dataset_config="v2.1", split="test", out_dir=OUT_ROOT / "ms_marco", batch_size=8, max_tokens=64, temp=0.0, top_p=1.0, keep_intermediates: bool = False):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # SAFETY CHECK: Ensure max_tokens doesn't exceed model capacity
+    safe_max_tokens = min(max_tokens, DEFAULT_MODEL_MAX_TOKENS - 100)
+    if safe_max_tokens != max_tokens:
+        logging.warning(f"[msmarco] Reduced max_tokens from {max_tokens} to {safe_max_tokens} for safety")
+        max_tokens = safe_max_tokens
+    
+    from datasets import load_dataset
+    logging.info("[msmarco] Loading dataset %s config=%s split=%s", dataset_key, dataset_config, split)
+    ds = load_dataset(dataset_key, dataset_config, split=split)
+    ds = ds.select(range(min(MAX_SAMPLES, len(ds))))
+    references = []
+    queries = []
+    for ex in ds:
+        qid = ex.get("query_id") or ex.get("id") or str(len(queries))
+        query = ex.get("query") or ex.get("question") or ex.get("query_text") or ""
+        answers = ex.get("answers") or []
+        if not isinstance(answers, list):
+            answers = [str(answers)]
+        references.append({"query_id": qid, "answers": answers if answers else [""]})
+        queries.append((qid, query))
+    ref_path = out_dir / "msmarco_references.jsonl"
+    cand_path = out_dir / "msmarco_candidates.jsonl"
+    with open(ref_path, "w", encoding="utf-8") as fh:
+        for rec in references:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    from vllm import SamplingParams as VSamplingParams
+    sp = VSamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens, skip_special_tokens=False)
+    candidates = []
+    logging.info(f"[msmarco] Generating answers for {len(queries)} queries (batch {batch_size})")
+    for i in range(0, len(queries), batch_size):
+        batch = queries[i:i+batch_size]
+        max_input_tokens = DEFAULT_MODEL_MAX_TOKENS - max_tokens - 100
+        prompts = [truncate_prompt(format_prompt(f"Answer the query: {q}", paragraph=None), max_input_tokens) for (_id, q) in batch]
+        outs = model.generate(prompts, sp)
+        for j, out in enumerate(outs):
+            text = (out.outputs[0].text or "").strip()
+            # Clean Self-RAG output
+            text = clean_selfrag_output(text)
+            qid = batch[j][0]
+            candidates.append({"query_id": qid, "answers": [text if text else ""]})
+    with open(cand_path, "w", encoding="utf-8") as fh:
+        for rec in candidates:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    script = resolve_script("msmarco")
+    metrics_path = out_dir / "msmarco_metrics.json"
+    try:
+        script_text = open(script, "r", encoding="utf-8").read()
+    except Exception:
+        script_text = ""
+    if "--out-file" in script_text or "--out_file" in script_text:
+        cmd = [str(script), str(ref_path), str(cand_path), "--out-file", str(metrics_path)]
+    else:
+        cmd = [str(script), str(ref_path), str(cand_path)]
+    metrics_found = run_and_capture_metrics(cmd, out_dir=out_dir, fallback_names=[metrics_path], metrics_basename=metrics_path.name, task_name="msmarco")
+
+    if not keep_intermediates:
+        for p in (ref_path, cand_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+    return metrics_found
+
 def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi/trivia_qa", split="test", out_dir=OUT_ROOT / "trivia", batch_size=8, max_tokens=64, temp=0.0, top_p=1.0, trivia_gold_path: Optional[str]=None, keep_intermediates: bool = False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # SAFETY CHECK: Ensure max_tokens doesn't exceed model capacity
+    safe_max_tokens = min(max_tokens, DEFAULT_MODEL_MAX_TOKENS - 100)
+    if safe_max_tokens != max_tokens:
+        logging.warning(f"[trivia] Reduced max_tokens from {max_tokens} to {safe_max_tokens} for safety")
+        max_tokens = safe_max_tokens
+    
     from datasets import load_dataset
     logging.info("[trivia] Loading dataset %s split=%s (config rc)", dataset_key, split)
     # Force the 'rc' config as requested
@@ -587,7 +859,7 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
     logging.info(f"[trivia] Generating {len(qlist)} predictions (batch {batch_size})")
     for i in range(0, len(qlist), batch_size):
         batch = qlist[i:i+batch_size]
-        max_input_tokens = DEFAULT_MODEL_MAX_TOKENS - max_tokens - 16
+        max_input_tokens = DEFAULT_MODEL_MAX_TOKENS - max_tokens - 100
         prompts = [truncate_prompt(format_prompt(t, paragraph=None), max_input_tokens) for (_id,t) in batch]
         outs = model.generate(prompts, sp)
         for j, out in enumerate(outs):
@@ -626,42 +898,6 @@ def run_triviaqa(model, sampling_params, format_prompt, dataset_key="mandarjoshi
     else:
         logging.info("[trivia] No trivia gold path provided; predictions saved.")
         return None
-
-# --- Self-RAG Output Cleaning Helper ---
-def clean_selfrag_output(text: str) -> str:
-    """
-    Clean Self-RAG output by removing special tokens and extracting the core answer.
-    Self-RAG outputs contain special tokens like [Retrieval], [Relevant], [Fully supported], etc.
-    """
-    if not text:
-        return ""
-    
-    # Remove Self-RAG special tokens
-    import re
-    
-    # Common Self-RAG special tokens to remove
-    selfrag_tokens = [
-        r'\[Retrieval\]',
-        r'\[No Retrieval\]',
-        r'\[Relevant\]',
-        r'\[Irrelevant\]', 
-        r'\[Partially supported\]',
-        r'\[Fully supported\]',
-        r'\[No support / Contradictory\]',
-        r'\[Utility:\d+\]',
-        r'<paragraph>.*?</paragraph>',
-        r'</s>',
-        r'<s>',
-    ]
-    
-    cleaned = text
-    for token_pattern in selfrag_tokens:
-        cleaned = re.sub(token_pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
-    
-    # Clean up extra whitespace
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    
-    return cleaned
 
 # --- CLI --------------------------------------------------------------------
 def parse_args():
@@ -762,46 +998,74 @@ def main():
             logging.exception(f"[main] Exception while running {name}: {e}")
             metrics_summary[name] = {"error": str(e)}
 
-def extract_metrics_from_text(text: str) -> dict:
-    """Extract metrics from plain text output (last resort)."""
-    metrics = {}
-    lines = text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Look for common metric patterns
-        patterns = [
-            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*%?)',
-            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s*[:\=]\s*([0-9]+\.?[0-9]*)',
-            r'([a-zA-Z][a-zA-Z0-9_\-]*)\s+([0-9]+\.?[0-9]*%?)',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, line, re.IGNORECASE)
-            for key, value in matches:
-                key = key.lower().replace('-', '_')
-                try:
-                    # Convert percentage to decimal
-                    if value.endswith('%'):
-                        metrics[key] = float(value[:-1])
-                    else:
-                        metrics[key] = float(value)
-                except ValueError:
-                    metrics[key] = value
-                    
-    return metrics
-
     if "ragtruth" in tasks:
         logging.info("[main] Running RAGTruth")
         ragtruth_samples = get_task_max_samples("ragtruth", args)
-        logging.info(f"[main] RAGTruth using {ragtruth_samples} samples")
+        ragtruth_tokens = get_task_max_tokens("ragtruth", args)
+        ragtruth_batch_size = get_task_batch_size("ragtruth", args)
+        logging.info(f"[main] RAGTruth using {ragtruth_samples} samples, {ragtruth_tokens} tokens, batch_size={ragtruth_batch_size}")
         out_file = OUT_ROOT / "ragtruth_preds.jsonl"
         # Temporarily set MAX_SAMPLES for this task
         old_max = MAX_SAMPLES
         MAX_SAMPLES = ragtruth_samples
+        # FIXED: Use correct RAGTruth dataset name (verify this is correct for your setup)
+        run_task_safely("ragtruth", run_ragtruth_adapter_and_eval, args.tgi_host, args.tgi_port, "RAGTruth/ragtruth", None, "test", str(out_file), "", model, sampling_params, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
+
+    if "squad" in tasks:
+        logging.info("[main] Running SQuAD v2")
+        squad_samples = get_task_max_samples("squad", args)
+        squad_tokens = get_task_max_tokens("squad", args)
+        squad_batch_size = get_task_batch_size("squad", args)
+        logging.info(f"[main] SQuAD v2 using {squad_samples} samples, {squad_tokens} tokens, batch_size={squad_batch_size}")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = squad_samples
+        run_task_safely("squad_v2", run_squad_v2, model, sampling_params, format_prompt, "rajpurkar/squad_v2", args.squad_split, OUT_ROOT/"squad_v2", squad_batch_size, squad_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
+
+    if "hotpot" in tasks:
+        logging.info("[main] Running HotPotQA")
+        hotpot_samples = get_task_max_samples("hotpot", args)
+        hotpot_tokens = get_task_max_tokens("hotpot", args)
+        hotpot_batch_size = get_task_batch_size("hotpot", args)
+        logging.info(f"[main] HotPotQA using {hotpot_samples} samples, {hotpot_tokens} tokens, batch_size={hotpot_batch_size}")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = hotpot_samples
+        run_task_safely("hotpot", run_hotpot, model, sampling_params, format_prompt, "hotpotqa/hotpot_qa", args.hotpot_split, OUT_ROOT/"hotpot", hotpot_batch_size, hotpot_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
+
+    if "msmarco" in tasks:
+        logging.info("[main] Running MS MARCO")
+        msmarco_samples = get_task_max_samples("msmarco", args)
+        msmarco_tokens = get_task_max_tokens("msmarco", args)
+        msmarco_batch_size = get_task_batch_size("msmarco", args)
+        logging.info(f"[main] MS MARCO using {msmarco_samples} samples, {msmarco_tokens} tokens, batch_size={msmarco_batch_size}")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = msmarco_samples
+        run_task_safely("msmarco", run_ms_marco, model, sampling_params, format_prompt, "microsoft/ms_marco", args.msmarco_config, args.msmarco_split, OUT_ROOT/"ms_marco", msmarco_batch_size, msmarco_tokens, args.temp, args.top_p, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
+
+    if "nq" in tasks:
+        logging.info("[main] Running Natural Questions")
+        nq_samples = get_task_max_samples("nq", args)
+        nq_tokens = get_task_max_tokens("nq", args)
+        nq_batch_size = get_task_batch_size("nq", args)
+        logging.info(f"[main] Natural Questions using {nq_samples} samples, {nq_tokens} tokens, batch_size={nq_batch_size}")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = nq_samples
+        run_task_safely("nq", run_natural_questions, OUT_ROOT/"nq", None, args.nq_split, args.nq_predictions, args.nq_empty, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_max
+
+    if "trivia" in tasks:
+        logging.info("[main] Running TriviaQA")
+        trivia_samples = get_task_max_samples("trivia", args)
+        trivia_tokens = get_task_max_tokens("trivia", args)
+        trivia_batch_size = get_task_batch_size("trivia", args)
+        logging.info(f"[main] TriviaQA using {trivia_samples} samples, {trivia_tokens} tokens, batch_size={trivia_batch_size}")
+        old_max = MAX_SAMPLES
+        MAX_SAMPLES = trivia_samples
+        run_task_safely("trivia", run_triviaqa, model, sampling_params, format_prompt, "mandarjoshi/trivia_qa", args.trivia_split, OUT_ROOT/"trivia", trivia_batch_size, trivia_tokens, args.temp, args.top_p, args.trivia_gold, KEEP_INTERMEDIATES)
+        MAX_SAMPLES = old_maxuth_samples
         run_task_safely("ragtruth", run_ragtruth_adapter_and_eval, args.tgi_host, args.tgi_port, "wandb/RAGTruth-processed", None, "test", str(out_file), "", model, sampling_params, KEEP_INTERMEDIATES)
         MAX_SAMPLES = old_max
 
