@@ -98,4 +98,4 @@ def is_null_span_list(span_list):
 def span_set_equal(span_list1, span_list2):
     """Check if two span sets are equal"""
     return set((s.start, s.end) for s in span_list1) == set((s.start, s.end) for s in span_list2)
-EOF
+
