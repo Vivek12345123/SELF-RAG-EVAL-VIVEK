@@ -942,4 +942,4 @@ def main():
                     if isinstance(value, (int, float)):
                         print(f"  {metric}: {value:.4f}")
                     else:
-                        print(f"
+                        print(f"  {metric}: {value}") 
