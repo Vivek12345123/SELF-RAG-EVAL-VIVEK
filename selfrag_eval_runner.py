@@ -139,13 +139,24 @@ class SelfRAGEvaluator:
             preds = self.model.generate(batch, self.sampling_params)
             
             for pred in preds:
-                if pred.outputs:
+                # vLLM may return different shapes; try common access patterns
+                raw_output = ""
+                try:
+                    # most common: pred.outputs[0].text
                     raw_output = pred.outputs[0].text
-                    answer = self.extract_answer_from_selfrag(raw_output)
-                    all_answers.append(answer)
-                else:
-                    all_answers.append("")
-        
+                except Exception:
+                    try:
+                        # sometimes pred[0].text
+                        raw_output = pred[0].text
+                    except Exception:
+                      try:
+                        # fallback to str(pred)
+                        raw_output = str(pred)
+                      except Exception:
+                        raw_output = ""
+                answer = self.extract_answer_from_selfrag(raw_output)
+                all_answers.append(answer)
+                
         return all_answers
     
     def extract_answer_from_selfrag(self, output: str) -> str:
