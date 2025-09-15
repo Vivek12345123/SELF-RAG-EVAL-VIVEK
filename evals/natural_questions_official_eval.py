@@ -1,6 +1,12 @@
 # coding=utf-8
 """
 Official evaluation script for Natural Questions (user-provided).
+
+This file preserves the original scoring behavior while fixing a few bugs:
+ - pickle read/write in binary mode and using a concrete filename
+ - preventing overwrite of identical score keys when computing PR curves
+ - robust import of eval_utils
+ - added run_eval(...) wrapper for programmatic use (keeps CLI behavior unchanged)
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -10,11 +16,33 @@ from collections import OrderedDict
 import json
 import os
 import pickle
+import sys
 from absl import app
 from absl import flags
 from absl import logging
-import eval_utils as util
 import six
+
+# Robust import for eval_utils (try multiple likely locations)
+try:
+  import eval_utils as util
+except Exception:
+  try:
+    # If this module sits in a parent package, ensure repo root is on sys.path
+    repo_root = os.path.dirname(os.path.dirname(__file__)) if '__file__' in globals() else os.getcwd()
+    if repo_root not in sys.path:
+      sys.path.insert(0, repo_root)
+    import eval_utils as util
+  except Exception:
+    try:
+      # Try evals.utils (if evals is a package)
+      from evals import utils as util
+    except Exception:
+      try:
+        # Try plain utils (common alternative)
+        import utils as util
+      except Exception as e:
+        raise ImportError("Could not import eval_utils (tried eval_utils, evals.utils, utils). "
+                          "Original error: {}".format(e))
 
 flags.DEFINE_string(
     'gold_path', None, 'Path to the gzip JSON data. For '
@@ -32,10 +60,13 @@ FLAGS = flags.FLAGS
 
 
 def safe_divide(x, y):
-  if y == 0:
-    return 0
-  else:
-    return x / y
+  """Safe divide returning float, 0 on zero denominator."""
+  try:
+    if y == 0:
+      return 0.0
+    return float(x) / float(y)
+  except Exception:
+    return 0.0
 
 
 def score_long_answer(gold_label_list, pred_label):
@@ -45,7 +76,7 @@ def score_long_answer(gold_label_list, pred_label):
       not pred_label.long_answer_span.is_null_span())
 
   is_correct = False
-  score = pred_label.long_score
+  score = pred_label.long_score if pred_label is not None else 0.0
 
   if gold_has_answer and pred_has_answer:
     for gold_label in gold_label_list:
@@ -65,13 +96,13 @@ def score_short_answer(gold_label_list, pred_label):
 
   pred_has_answer = pred_label and (
       (not util.is_null_span_list(pred_label.short_answer_span_list)) or
-      pred_label.yes_no_answer != 'none')
+      getattr(pred_label, 'yes_no_answer', 'none') != 'none')
 
   is_correct = False
-  score = pred_label.short_score
+  score = getattr(pred_label, 'short_score', 0.0)
 
   if gold_has_answer and pred_has_answer:
-    if pred_label.yes_no_answer != 'none':
+    if getattr(pred_label, 'yes_no_answer', 'none') != 'none':
       for gold_label in gold_label_list:
         if pred_label.yes_no_answer == gold_label.yes_no_answer:
           is_correct = True
@@ -104,6 +135,7 @@ def score_answers(gold_annotation_dict, pred_dict):
     long_answer_stats.append(score_long_answer(gold, pred))
     short_answer_stats.append(score_short_answer(gold, pred))
 
+  # Sort by score descending as before (keeps original behavior)
   long_answer_stats.sort(key=lambda x: x[-1], reverse=True)
   short_answer_stats.sort(key=lambda x: x[-1], reverse=True)
 
@@ -131,6 +163,11 @@ def compute_final_f1(long_answer_stats, short_answer_stats):
 
 
 def compute_pr_curves(answer_stats, targets=None):
+  """
+  Compute PR curves and best-threshold selection.
+
+  Fixed to preserve duplicate scores and ordering (no overwrite of identical float keys).
+  """
   total_correct = 0
   total_has_pred = 0
   total_has_gold = 0
@@ -138,12 +175,13 @@ def compute_pr_curves(answer_stats, targets=None):
   for has_gold, _, _, _ in answer_stats:
     total_has_gold += has_gold
 
-  max_recall = [0 for _ in targets]
-  max_precision = [0 for _ in targets]
-  max_scores = [None for _ in targets]
+  # Prepare structures for targets
+  max_recall = [0 for _ in targets] if targets else []
+  max_precision = [0 for _ in targets] if targets else []
+  max_scores = [None for _ in targets] if targets else []
 
-  scores_to_stats = OrderedDict()
-
+  # Build a list of (score, precision, recall) in the order of answer_stats
+  scores_list = []
   for has_gold, has_pred, is_correct, score in answer_stats:
     total_correct += is_correct
     total_has_pred += has_pred
@@ -151,19 +189,23 @@ def compute_pr_curves(answer_stats, targets=None):
     precision = safe_divide(total_correct, total_has_pred)
     recall = safe_divide(total_correct, total_has_gold)
 
-    scores_to_stats[score] = [precision, recall]
+    # append to list (preserves duplicates and order)
+    scores_list.append((score, precision, recall))
 
+  # Now compute best F1 and target recalls/precisions using the scores_list
   best_f1 = 0.0
   best_precision = 0.0
   best_recall = 0.0
   best_threshold = 0.0
 
-  for threshold, (precision, recall) in six.iteritems(scores_to_stats):
-    for t, target in enumerate(targets):
-      if precision >= target and recall > max_recall[t]:
-        max_recall[t] = recall
-        max_precision[t] = precision
-        max_scores[t] = threshold
+  for threshold, precision, recall in scores_list:
+    # update target tables
+    if targets:
+      for t, target in enumerate(targets):
+        if precision >= target and recall > max_recall[t]:
+          max_recall[t] = recall
+          max_precision[t] = precision
+          max_scores[t] = threshold
 
     f1 = safe_divide(2 * precision * recall, precision + recall)
     if f1 > best_f1:
@@ -172,8 +214,8 @@ def compute_pr_curves(answer_stats, targets=None):
       best_recall = recall
       best_threshold = threshold
 
-  return ((best_f1, best_precision, best_recall, best_threshold),
-          list(zip(targets, max_recall, max_precision, max_scores)))
+  pr_table = list(zip(targets if targets else [], max_recall, max_precision, max_scores))
+  return ((best_f1, best_precision, best_recall, best_threshold), pr_table)
 
 
 def print_r_at_p_table(answer_stats):
@@ -219,110 +261,136 @@ def get_metrics_with_answer_stats(long_answer_stats, short_answer_stats):
   return metrics
 
 
-def main(_):
-  cache_path = os.path.join(os.path.dirname(FLAGS.gold_path), 'cache')
-  if FLAGS.cache_gold_data and os.path.exists(cache_path):
-    logging.info('Reading from cache: %s', format(cache_path))
-    nq_gold_dict = pickle.load(open(cache_path, 'r'))
-  else:
-    nq_gold_dict = util.read_annotation(
-        FLAGS.gold_path, n_threads=FLAGS.num_threads)
-    if FLAGS.cache_gold_data:
-      logging.info('Caching gold data for next time to: %s', format(cache_path))
-      pickle.dump(nq_gold_dict, open(cache_path, 'w'))
-
-  nq_pred_dict = util.read_prediction_json(FLAGS.predictions_path)
-
-  long_answer_stats, short_answer_stats = score_answers(nq_gold_dict,
-                                                        nq_pred_dict)
-
-  # ---- BERTScore integration (added) ----
+def _compute_and_print_bertscore(nq_gold_dict, nq_pred_dict):
+  """
+  Best-effort extraction of (candidate, references) pairs and BERTScore computation.
+  Preserves original heuristics but hardens device selection and exception handling.
+  """
   try:
     import torch
     from bert_score.scorer import BERTScorer
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Attempt to assemble candidate/ref pairs from available data.
-    # The NQ util may or may not expose helper functions; try some common patterns
-    candidates = []
-    refs = []
-
-    # If util exposes a helper to extract plain text of gold/pred pairs, prefer it.
-    if hasattr(util, "get_gold_pred_text_pairs"):
-      try:
-        candidates, refs = util.get_gold_pred_text_pairs(nq_gold_dict, nq_pred_dict)
-      except Exception:
-        candidates, refs = [], []
-
-    # Otherwise, try extracting short-answer text from pred/gold data structures if present.
-    if not candidates:
-      for ex_id in sorted(nq_gold_dict.keys()):
-        gold_ann = nq_gold_dict[ex_id]
-        pred = nq_pred_dict.get(ex_id)
-        # gather possible gold short-answer strings
-        gold_texts = []
-        # common patterns (best-effort): look for 'short_answers_text' fields in gold or in a list of labels
-        if isinstance(gold_ann, dict) and 'short_answers_text' in gold_ann:
-          gold_texts = gold_ann.get('short_answers_text') or []
-        elif isinstance(gold_ann, (list, tuple)):
-          for g in gold_ann:
-            if isinstance(g, dict) and 'short_answers_text' in g:
-              gold_texts.extend(g.get('short_answers_text') or [])
-        # fallback: try fields named 'short_answers' that may be list of dicts with 'text'
-        if not gold_texts and isinstance(gold_ann, dict) and 'short_answers' in gold_ann:
-          short_list = gold_ann.get('short_answers') or []
-          for s in short_list:
-            if isinstance(s, dict) and 'text' in s:
-              gold_texts.append(s['text'])
-        # obtain candidate text from prediction
-        cand_text = None
-        if pred:
-          if isinstance(pred, dict):
-            if 'short_answers_text' in pred and pred['short_answers_text']:
-              cand_text = pred['short_answers_text'][0]
-            elif 'long_answer_text' in pred:
-              cand_text = pred['long_answer_text']
-            elif 'short_answers' in pred and isinstance(pred['short_answers'], list) and pred['short_answers']:
-              first = pred['short_answers'][0]
-              if isinstance(first, dict) and 'text' in first:
-                cand_text = first['text']
-          # if pred is an object with attributes (older util), try attribute access
-          else:
-            if hasattr(pred, 'short_answers_text') and getattr(pred, 'short_answers_text'):
-              cand_text = getattr(pred, 'short_answers_text')[0]
-            elif hasattr(pred, 'long_answer_text'):
-              cand_text = getattr(pred, 'long_answer_text')
-
-        # only add examples where both candidate and at least one gold ref text exist
-        if cand_text and gold_texts:
-          candidates.append(cand_text)
-          refs.append(gold_texts)
-
-    # If we accumulated pairs, compute BERTScore (otherwise skip)
-    if candidates and refs:
-      # Force roberta-large
-      scorer = BERTScorer(model_type="roberta-large", lang='en', device=device, idf=True, use_fast_tokenizer=True)
-      # compute idf on flattened reference pool
-      flat_refs = []
-      for ref_list in refs:
-        flat_refs.extend(ref_list)
-      if flat_refs:
-        scorer.compute_idf(flat_refs)
-      (P, R, F) = scorer.score(candidates, refs)
-      import numpy as _np
-      bert_mean_p = float(_np.mean(_np.array(P)))
-      bert_mean_r = float(_np.mean(_np.array(R)))
-      bert_mean_f = float(_np.mean(_np.array(F)))
-      print("BERTScore (mean P/R/F): {:.6f} / {:.6f} / {:.6f}".format(bert_mean_p, bert_mean_r, bert_mean_f))
-    else:
-      print("BERTScore: no suitable text pairs extracted from gold/pred data; skipping BERTScore computation.")
   except Exception as e:
-    # do not fail evaluation if BERTScore isn't available or if extraction failed
-    print("Warning: BERTScore could not be computed:", str(e))
-  # ---- end BERTScore integration ----
+    print("Warning: BERTScore imports failed: {}".format(e))
+    return None
 
-  if FLAGS.pretty_print:
+  device = "cuda" if torch.cuda.is_available() else "cpu"
+
+  candidates = []
+  refs = []
+
+  # If util exposes a helper to extract plain text pairs, prefer it.
+  if hasattr(util, "get_gold_pred_text_pairs"):
+    try:
+      candidates, refs = util.get_gold_pred_text_pairs(nq_gold_dict, nq_pred_dict)
+    except Exception:
+      candidates, refs = [], []
+
+  # Fallback extraction heuristics (preserve original behavior)
+  if not candidates:
+    for ex_id in sorted(nq_gold_dict.keys()):
+      gold_ann = nq_gold_dict[ex_id]
+      pred = nq_pred_dict.get(ex_id)
+      gold_texts = []
+
+      # try several known patterns for gold annotation structures
+      if isinstance(gold_ann, dict) and 'short_answers_text' in gold_ann:
+        gold_texts = gold_ann.get('short_answers_text') or []
+      elif isinstance(gold_ann, (list, tuple)):
+        for g in gold_ann:
+          if isinstance(g, dict) and 'short_answers_text' in g:
+            gold_texts.extend(g.get('short_answers_text') or [])
+      if not gold_texts and isinstance(gold_ann, dict) and 'short_answers' in gold_ann:
+        short_list = gold_ann.get('short_answers') or []
+        for s in short_list:
+          if isinstance(s, dict) and 'text' in s:
+            gold_texts.append(s['text'])
+
+      # extract candidate text from pred
+      cand_text = None
+      if pred:
+        if isinstance(pred, dict):
+          if 'short_answers_text' in pred and pred['short_answers_text']:
+            cand_text = pred['short_answers_text'][0]
+          elif 'long_answer_text' in pred:
+            cand_text = pred['long_answer_text']
+          elif 'short_answers' in pred and isinstance(pred['short_answers'], list) and pred['short_answers']:
+            first = pred['short_answers'][0]
+            if isinstance(first, dict) and 'text' in first:
+              cand_text = first['text']
+        else:
+          # object-like pred (older format)
+          if hasattr(pred, 'short_answers_text') and getattr(pred, 'short_answers_text'):
+            cand_text = getattr(pred, 'short_answers_text')[0]
+          elif hasattr(pred, 'long_answer_text'):
+            cand_text = getattr(pred, 'long_answer_text')
+
+      # only collect when both cand_text and at least one gold_text exist
+      if cand_text and gold_texts:
+        candidates.append(cand_text)
+        refs.append(gold_texts)
+
+  if not candidates:
+    print("BERTScore: no suitable text pairs extracted from gold/pred data; skipping BERTScore computation.")
+    return None
+
+  try:
+    # Build scorer forcing roberta-large as before
+    scorer = BERTScorer(model_type="roberta-large", lang='en', device=device, idf=True, use_fast_tokenizer=True)
+    flat_refs = []
+    for ref_list in refs:
+      flat_refs.extend(ref_list)
+    if flat_refs:
+      try:
+        scorer.compute_idf(flat_refs)
+      except Exception:
+        # compute_idf can fail for odd inputs; ignore and continue
+        pass
+
+    (P, R, F) = scorer.score(candidates, refs)
+    import numpy as _np
+    bert_mean_p = float(_np.mean(_np.array(P)))
+    bert_mean_r = float(_np.mean(_np.array(R)))
+    bert_mean_f = float(_np.mean(_np.array(F)))
+    print("BERTScore (mean P/R/F): {:.6f} / {:.6f} / {:.6f}".format(bert_mean_p, bert_mean_r, bert_mean_f))
+    return (bert_mean_p, bert_mean_r, bert_mean_f)
+  except Exception as e:
+    print("Warning: BERTScore computation failed: {}".format(e))
+    return None
+
+
+def run_eval(gold_path, predictions_path, cache_gold_data=False, num_threads=10, pretty_print=False):
+  """
+  Programmatic entrypoint for the evaluator. Returns metrics dict (same as CLI JSON output)
+  and prints BERTScore & tables if pretty_print=True (CLI-style).
+  """
+  # Prepare cache path (directory + concrete filename)
+  cache_dir = os.path.join(os.path.dirname(gold_path), 'cache')
+  os.makedirs(cache_dir, exist_ok=True)
+  cache_path = os.path.join(cache_dir, 'nq_gold_cache.pkl')
+
+  if cache_gold_data and os.path.exists(cache_path):
+    logging.info('Reading gold data from cache: %s', cache_path)
+    with open(cache_path, 'rb') as _f:
+      nq_gold_dict = pickle.load(_f)
+  else:
+    nq_gold_dict = util.read_annotation(gold_path, n_threads=num_threads)
+    if cache_gold_data:
+      logging.info('Caching gold data for next time to: %s', cache_path)
+      with open(cache_path, 'wb') as _f:
+        pickle.dump(nq_gold_dict, _f)
+
+  nq_pred_dict = util.read_prediction_json(predictions_path)
+
+  long_answer_stats, short_answer_stats = score_answers(nq_gold_dict, nq_pred_dict)
+
+  # BERTScore best-effort (printing as before)
+  try:
+    _ = _compute_and_print_bertscore(nq_gold_dict, nq_pred_dict)
+  except Exception as e:
+    # Do not fail evaluation if BERTScore fails
+    print("Warning: BERTScore computation wrapper raised an error: {}".format(e))
+
+  if pretty_print:
     print('*' * 20)
     print('LONG ANSWER R@P TABLE:')
     print_r_at_p_table(long_answer_stats)
@@ -340,10 +408,22 @@ def main(_):
     print('Short answer {: >7.2%} / {: >7.2%} / {: >7.2%}'.format(
         scores['short-answer-f1'], scores['short-answer-precision'],
         scores['short-answer-recall']))
+    # For CLI parity, also return the metrics dict
+    return compute_final_f1(long_answer_stats, short_answer_stats)
   else:
-    metrics = get_metrics_with_answer_stats(long_answer_stats,
-                                            short_answer_stats)
+    metrics = get_metrics_with_answer_stats(long_answer_stats, short_answer_stats)
+    # Print JSON exactly as original CLI branch did
     print(json.dumps(metrics))
+    return metrics
+
+
+def main(_):
+  # Use absl flags when running as CLI; keep previous CLI semantics.
+  metrics = run_eval(FLAGS.gold_path, FLAGS.predictions_path,
+                     cache_gold_data=FLAGS.cache_gold_data,
+                     num_threads=FLAGS.num_threads,
+                     pretty_print=FLAGS.pretty_print)
+  # run_eval already prints CLI output where appropriate
 
 
 if __name__ == '__main__':

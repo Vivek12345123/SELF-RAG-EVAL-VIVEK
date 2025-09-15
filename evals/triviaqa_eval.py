@@ -9,6 +9,7 @@ import sys
 import argparse
 import utils.dataset_utils
 import utils.utils
+import torch
 
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
