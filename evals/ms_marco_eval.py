@@ -16,9 +16,10 @@ import spacy
 
 import sacrebleu
 from rouge_score import rouge_scorer
-import spacy
 
-from spacy.lang.en import English as NlpEnglish
+from spacy.lang.en import English
+NLP = English()
+
 nlp = spacy.load('en_core_web_lg')
 QUERY_ID_JSON_ID = 'query_id'
 ANSWERS_JSON_ID = 'answers'
