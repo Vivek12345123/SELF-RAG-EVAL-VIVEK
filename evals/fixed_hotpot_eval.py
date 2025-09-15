@@ -107,7 +107,7 @@ def update_sp(metrics, prediction, gold):
     return em, prec, recall
 
 
-def compute_bert_score(predictions, references, device='cuda', batch_size=64):
+def compute_bert_score(predictions, references, device='cuda', batch_size=4):
     """
     Compute BERTScore using roberta-large model
     
