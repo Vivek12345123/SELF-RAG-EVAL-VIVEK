@@ -173,24 +173,30 @@ class SelfRAGEvaluator:
                      if self.normalize_answer(pred) == self.normalize_answer(ref))
         return correct / len(predictions)
     
+    from collections import Counter
+
     def compute_f1_score(self, prediction: str, reference: str) -> float:
-        """Compute F1 score between prediction and reference"""
+        """Compute F1 score between prediction and reference (token multiplicity preserved)."""
         pred_tokens = self.normalize_answer(prediction).split()
         ref_tokens = self.normalize_answer(reference).split()
-        
+
+        # Edge cases
         if not pred_tokens or not ref_tokens:
             return 0.0 if pred_tokens != ref_tokens else 1.0
-        
-        common = set(pred_tokens) & set(ref_tokens)
-        
-        if len(common) == 0:
+
+        pred_ct = Counter(pred_tokens)
+        ref_ct = Counter(ref_tokens)
+        common = pred_ct & ref_ct
+        num_same = sum(common.values())
+
+        if num_same == 0:
             return 0.0
-        
-        precision = len(common) / len(pred_tokens)
-        recall = len(common) / len(ref_tokens)
+
+        precision = num_same / len(pred_tokens)
+        recall = num_same / len(ref_tokens)
         f1 = 2 * precision * recall / (precision + recall)
-        
         return f1
+
     
     def normalize_answer(self, text: str) -> str:
         """Normalize answer for comparison"""
