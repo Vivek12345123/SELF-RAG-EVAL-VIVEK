@@ -1,0 +1,7 @@
+Benchmark,HasAns_exact,HasAns_f1,NoAns_exact,NoAns_f1,attribution_accuracy,bert_f1,bert_precision,bert_recall,context_exact_match,context_f1,error,exact,exact_match,f1,factual_consistency,hallucination_rate,joint_exact_match,joint_f1,map,mrr,ndcg@10,recall@1,recall@10,recall@5,sp_exact_match,sp_f1
+squad,0.0222,0.2282,0.0000,0.0000,,0.3986,0.3908,0.4073,,,,0.0100,,0.1027,,,,,,,,,,,,
+hotpot,,,,,,0.8516,0.8235,0.8827,,,,,0.0700,0.1890,,,0.0000,0.0945,,,,,,,0.0000,0.0000
+natural_questions,,,,,,,,,,,"string indices must be integers, not 'str'",,,,,,,,,,,,,,,
+triviaqa,,,,,,0.8067,0.7876,0.8272,0.0000,0.0000,,,0.0000,0.0000,,,,,,,,,,,,
+ms_marco,,,,,,0.0000,0.0000,0.0000,,,,,0.0000,,,,,,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,,
+ragtruth,,,,,0.0000,,,,,,,,0.0000,,0.0000,0.0000,,,,,,,,,,

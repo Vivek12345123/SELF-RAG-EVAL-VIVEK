@@ -1,0 +1,10 @@
+{
+  "short_answer_exact_match": 0.0,
+  "short_answer_f1": 0.0,
+  "long_answer_exact_match": 0.0,
+  "long_answer_f1": 0.0,
+  "yes_no_accuracy": 0.0,
+  "bert_precision": 0.0,
+  "bert_recall": 0.0,
+  "bert_f1": 0.0
+}

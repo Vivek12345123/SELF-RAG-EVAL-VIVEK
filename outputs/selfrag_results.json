@@ -1,0 +1,69 @@
+{
+  "squad": {
+    "HasAns_exact": 0.022222222222222223,
+    "HasAns_f1": 0.22816946850347486,
+    "NoAns_exact": 0.0,
+    "NoAns_f1": 0.0,
+    "exact": 0.01,
+    "f1": 0.10267626082656371,
+    "bert_precision": 0.3908281624317169,
+    "bert_recall": 0.40733253955841064,
+    "bert_f1": 0.3985654413700104
+  },
+  "hotpot": {
+    "exact_match": 0.07,
+    "f1": 0.18899789959704233,
+    "sp_exact_match": 0.0,
+    "sp_f1": 0.0,
+    "joint_exact_match": 0.0,
+    "joint_f1": 0.09449894979852116,
+    "bert_precision": 0.8234584927558899,
+    "bert_recall": 0.8826904892921448,
+    "bert_f1": 0.8515527248382568
+  },
+  "natural_questions": {
+    "error": "string indices must be integers, not 'str'"
+  },
+  "triviaqa": {
+    "exact_match": 0.0,
+    "f1": 0.0,
+    "context_exact_match": 0.0,
+    "context_f1": 0.0,
+    "bert_precision": 0.7876344323158264,
+    "bert_recall": 0.8272396922111511,
+    "bert_f1": 0.8067405819892883
+  },
+  "ms_marco": {
+    "mrr": 0.0,
+    "recall@1": 0.0,
+    "recall@5": 0.0,
+    "recall@10": 0.0,
+    "map": 0.0,
+    "ndcg@10": 0.0,
+    "exact_match": 0.0,
+    "bert_precision": 0.0,
+    "bert_recall": 0.0,
+    "bert_f1": 0.0
+  },
+  "ragtruth": {
+    "hallucination_rate": 0.0,
+    "factual_consistency": 0.0,
+    "exact_match": 0.0,
+    "attribution_accuracy": 0.0
+  },
+  "metadata": {
+    "model": "selfrag/selfrag_llama2_7b",
+    "timestamp": "2025-09-15 23:54:19",
+    "bert_score_model": "roberta-large",
+    "max_tokens_per_sample": 512,
+    "batch_size": 4,
+    "dataset_samples": {
+      "squad": 100,
+      "hotpot": 100,
+      "natural_questions": 100,
+      "triviaqa": 100,
+      "ms_marco": 100,
+      "ragtruth": 100
+    }
+  }
+}

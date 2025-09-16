@@ -20,6 +20,8 @@ import numpy as np
 from collections import defaultdict
 import re
 
+from collections import Counter
+
 # Import for Self-RAG model
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -69,7 +71,7 @@ class SelfRAGEvaluator:
         
         # Set sampling parameters with token limits
         self.sampling_params = SamplingParams(
-            temperature=0.0, 
+            temperature=0.1, 
             top_p=1.0, 
             max_tokens=max_tokens_per_sample, 
             skip_special_tokens=False
@@ -105,9 +107,9 @@ class SelfRAGEvaluator:
     
     def truncate_text(self, text: str, max_tokens: int = None) -> str:
         """Truncate text to fit within token limits"""
+        text = str(text)  # Ensure input is a string
         if max_tokens is None:
             max_tokens = self.max_model_tokens - self.max_tokens_per_sample - 100  # Buffer
-        
         tokens = self.tokenizer.encode(text, truncation=True, max_length=max_tokens)
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
     
@@ -184,7 +186,7 @@ class SelfRAGEvaluator:
                      if self.normalize_answer(pred) == self.normalize_answer(ref))
         return correct / len(predictions)
     
-    from collections import Counter
+    # ...existing code...
 
     def compute_f1_score(self, prediction: str, reference: str) -> float:
         """Compute F1 score between prediction and reference (token multiplicity preserved)."""
@@ -489,45 +491,51 @@ class SelfRAGEvaluator:
         return metrics
     
     def evaluate_natural_questions(self) -> Dict[str, Any]:
-        """Evaluate on Natural Questions dataset"""
+        """Evaluate on Natural Questions using proper NQ evaluation"""
         print("\nEvaluating on Natural Questions...")
-        
-        # FIXED: Load dataset with correct parameters
         try:
-            dataset = load_dataset("google-research-datasets/natural_questions", "default", split="validation")
-            max_examples = self.dataset_samples.get('natural_questions', min(1000, len(dataset)))
+            dataset = load_dataset("google-research-datasets/natural_questions", 
+                                 "default", split="validation")
+            max_examples = self.dataset_samples.get('natural_questions', 500)
             dataset = dataset.select(range(min(max_examples, len(dataset))))
         except Exception as e:
             print(f"Error loading Natural Questions: {e}")
-            return {}
-        
+            return {"error": str(e)}
         questions = []
-        gold_answers = []
-        
+        gold_examples = []
         for example in tqdm(dataset, desc="Preparing Natural Questions"):
-            questions.append(example['question'])
-            gold_answers.append(example.get('answer', []) if 'answer' in example else [])
-        
+            if (
+                isinstance(example, dict)
+                and 'annotations' in example
+                and isinstance(example['annotations'], list)
+                and all(isinstance(a, dict) for a in example['annotations'])
+            ):
+                gold_examples.append(example)
+            if 'question_text' in example:
+                question = example['question_text']
+            elif 'question' in example:
+                question = example['question']
+            else:
+                continue
+            questions.append(question)
         # Generate predictions
         print("Generating predictions...")
         predicted_answers = self.generate_answers_batch(questions)
-        
-        # Calculate metrics
-        metrics = self.calculate_nq_metrics(predicted_answers, gold_answers)
-        
-        # Add BERTScore
-        if self.bert_scorer:
-            # Flatten gold answers for BERTScore
-            flat_gold = [ans[0] if ans else "" for ans in gold_answers]
-            bert_metrics = self.compute_bert_score_simple(predicted_answers, flat_gold)
-            metrics.update(bert_metrics)
-        
+        # Import and use the text generation evaluator
+        import sys
+        sys.path.append('.')  # Add current directory to path
+        from nq_text_eval import evaluate_nq_with_official_metrics
+        metrics = evaluate_nq_with_official_metrics(
+            predicted_answers, 
+            gold_examples, 
+            use_bert_score=True
+        )
         # Save outputs
         os.makedirs("outputs/nq", exist_ok=True)
         with open("outputs/nq/metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
-        
         return metrics
+        
     
     def calculate_nq_metrics(self, predictions: List[str], references: List[List[str]]) -> Dict[str, float]:
         """Calculate Natural Questions metrics"""
@@ -583,8 +591,14 @@ class SelfRAGEvaluator:
             
             # Use search results as context
             search_contexts = example.get('search_results', [])
-            if search_contexts:
-                context = " ".join([ctx.get('search_context', '') for ctx in search_contexts[:3]])[:2000]
+            if isinstance(search_contexts, list) and search_contexts:
+                context_list = []
+                for ctx in search_contexts[:3]:
+                    val = ctx.get('search_context', '')
+                    if isinstance(val, str):
+                        context_list.append(val)
+                context = " ".join(context_list)
+                context = context[:2000]
             else:
                 context = ""
             contexts.append(context)
@@ -665,17 +679,21 @@ class SelfRAGEvaluator:
             questions.append(example['query'])
             
             # Use passages as context
-            if 'passages' in example and example['passages']:
-                passages = example['passages']
-                context = " ".join([p['passage_text'] for p in passages[:3] if 'passage_text' in p])[:2000]
-                
+            passages = example.get('passages', [])
+            if isinstance(passages, list) and passages:
+                context_list = []
+                for p in passages[:3]:
+                    val = p.get('passage_text', '')
+                    if isinstance(val, str):
+                        context_list.append(val)
+                context = " ".join(context_list)
+                context = context[:2000]
                 # For ranking metrics
                 relevance = [1 if p.get('is_selected', 0) == 1 else 0 for p in passages[:10]]
                 ranked_results.append(relevance)
             else:
                 context = ""
                 ranked_results.append([0] * 10)
-            
             contexts.append(context)
             gold_answers.append(example.get('answers', ['No Answer Present.']))
         

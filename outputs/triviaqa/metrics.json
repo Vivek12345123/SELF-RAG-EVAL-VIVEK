@@ -1,0 +1,9 @@
+{
+  "exact_match": 0.0,
+  "f1": 0.0,
+  "context_exact_match": 0.0,
+  "context_f1": 0.0,
+  "bert_precision": 0.7872911095619202,
+  "bert_recall": 0.8252865076065063,
+  "bert_f1": 0.8056668043136597
+}

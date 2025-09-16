@@ -1,0 +1,12 @@
+{
+  "mrr": 0.0,
+  "recall@1": 0.0,
+  "recall@5": 0.0,
+  "recall@10": 0.0,
+  "map": 0.0,
+  "ndcg@10": 0.0,
+  "exact_match": 0.0,
+  "bert_precision": 0.0,
+  "bert_recall": 0.0,
+  "bert_f1": 0.0
+}
